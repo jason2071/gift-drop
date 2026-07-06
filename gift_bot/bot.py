@@ -19,8 +19,7 @@ from . import clicker
 from . import gifts
 from . import matcher
 
-BASE_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = BASE_DIR.parent / "assets"
+ASSETS_DIR = gifts.ASSETS_DIR  # writable location (per-user when packaged)
 ICON_TEMPLATE_PATH = ASSETS_DIR / "love-you.png"
 POPUP_TEMPLATE_PATH = ASSETS_DIR / "love-you-send.png"
 # Optional: a user-cropped Send button for a more exact click.

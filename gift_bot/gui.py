@@ -83,6 +83,7 @@ class App:
         self._preview_win: tk.Toplevel | None = None
 
         self._saved = config.load()
+        gifts.seed()  # packaged build: populate the writable assets dir on first run
         # store  = every gift found in assets/ (the full library)
         # shortcuts = the curated subset pinned to the main "Gift to send" bar
         self.store: list[gifts.Gift] = gifts.discover()
@@ -230,7 +231,7 @@ class App:
 
     def _set_app_icon(self) -> None:
         """Set the title-bar / taskbar icon. Best-effort — never fatal."""
-        ico = gifts.ASSETS_DIR / "app.ico"
+        ico = gifts.BUNDLED_ASSETS_DIR / "app.ico"  # read-only bundled icon
         try:
             if ico.exists():
                 self.root.iconbitmap(default=str(ico))

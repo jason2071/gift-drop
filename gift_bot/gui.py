@@ -62,6 +62,8 @@ class App:
         self.root = root
         root.title(APP_TITLE)
         root.configure(bg=BG)
+        root.resizable(False, False)  # fixed size; _fit_window drives the size
+        self._set_app_icon()
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.stop_event = threading.Event()
@@ -226,20 +228,24 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectForeground", BTN_FG)
         self.root.option_add("*TCombobox*Listbox.font", FONT_SM)
 
+    def _set_app_icon(self) -> None:
+        """Set the title-bar / taskbar icon. Best-effort — never fatal."""
+        ico = gifts.ASSETS_DIR / "app.ico"
+        try:
+            if ico.exists():
+                self.root.iconbitmap(default=str(ico))
+        except Exception:  # noqa: BLE001 - a missing/odd icon must not crash the UI
+            pass
+
     def _fit_window(self, *, grow_only: bool = False) -> None:
-        """Size the window to its natural content height so the action buttons
-        are never clipped, regardless of display scaling. ``grow_only`` keeps the
-        current outer size (used after the bar gains tiles) but ``minsize`` always
-        tracks the natural height so the window can still be shrunk after unpin."""
+        """Size the window to its natural content so the action buttons are never
+        clipped, regardless of display scaling. The window is not user-resizable,
+        so it always matches content exactly. ``grow_only`` is accepted for call
+        compatibility but ignored."""
         self.root.update_idletasks()
         w = max(self.root.winfo_reqwidth(), 540)
         h = self.root.winfo_reqheight()
-        gw, gh = w, h
-        if grow_only and self.root.winfo_ismapped():
-            gw = max(w, self.root.winfo_width())
-            gh = max(h, self.root.winfo_height())
-        self.root.geometry(f"{gw}x{gh}")
-        self.root.minsize(w, h)  # natural size, not monotonic
+        self.root.geometry(f"{w}x{h}")
 
     def _card(self, *, expand: bool = False) -> ttk.Frame:
         """A flat white card on the base background. Separation comes from the

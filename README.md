@@ -78,6 +78,13 @@ button) for `<name>-send.png`.
 | Retries | Detection attempts before stopping (default 3). |
 | Dry-run | Detect + preview only, no clicking. |
 
+## Updating
+
+The packaged app checks GitHub for a newer release on launch (and when you click
+the version label in the header). If one is found it offers to download the new
+`.exe` and restart into it — no manual re-download or re-install. Your gifts and
+settings live under `%APPDATA%/GiftDrop/` and are kept across updates.
+
 ## Notes & safety
 
 - **Foreground clicking takes over the mouse** while running. Do not use the PC

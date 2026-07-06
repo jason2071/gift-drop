@@ -18,6 +18,7 @@ import shutil
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -29,8 +30,10 @@ from . import capture
 from . import config
 from . import gifts
 from . import matcher
+from . import updater
 
 APP_TITLE = "GiftDrop"
+from . import __version__ as APP_VERSION
 
 
 # --- palette --------------------------------------------------------------
@@ -103,7 +106,10 @@ class App:
         self._build_ui()
         self.refresh_windows()
         self._fit_window()
+        self._update_busy = False
         self.root.after(100, self._drain_log)
+        # Auto-check for a newer release shortly after launch (silent if none).
+        self.root.after(2500, lambda: self._check_updates(manual=False))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # Esc cancels a run when GiftDrop has focus; _watch_escape covers the
         # case where the target window is on top. Bound to root only (not
@@ -266,9 +272,14 @@ class App:
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=PAD, pady=(PAD, GAP))
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(
-            header, text="TikTok gift-send macro", style="Subtitle.TLabel"
-        ).pack(side="left", padx=(10, 0))
+        ver = ttk.Label(
+            header,
+            text=f"v{APP_VERSION}  ·  check for updates",
+            style="Subtitle.TLabel",
+            cursor="hand2",
+        )
+        ver.pack(side="left", padx=(10, 0))
+        ver.bind("<Button-1>", lambda _e: self._check_updates(manual=True))
         self.status_label = tk.Label(header, bg=BG, font=FONT_SM, fg=MUTED)
         self.status_label.pack(side="right")
         self._set_status("idle")
@@ -1002,7 +1013,7 @@ class App:
             self._apply_unlimited()  # keep Count greyed if Unlimited is still on
 
     def start(self) -> None:
-        if self.worker is not None or self._dry_busy:
+        if self.worker is not None or self._dry_busy or self._update_busy:
             return
         hwnd = self._selected_hwnd()
         if hwnd is None:
@@ -1163,6 +1174,83 @@ class App:
         label.image = photo  # keep a reference
         label.pack(padx=PAD, pady=PAD)
         self._preview_win = win
+
+    # ---- auto-update -----------------------------------------------------
+    def _check_updates(self, *, manual: bool) -> None:
+        """Check GitHub for a newer release on a background thread. ``manual``
+        surfaces an 'up to date' message; the silent startup check does not."""
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if manual:
+            self.log("Checking for updates...")
+
+        def work() -> None:
+            upd = updater.check(APP_VERSION)
+            self._ui_queue.put(lambda: self._on_update_result(upd, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, upd, manual: bool) -> None:
+        self._update_busy = False
+        if upd is None:
+            if manual:
+                messagebox.showinfo(
+                    APP_TITLE, f"You're on the latest version (v{APP_VERSION})."
+                )
+            return
+        mb = upd.size / (1024 * 1024)
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"Update available: v{upd.version}\n"
+            f"You have v{APP_VERSION}.\n\n"
+            f"Download ({mb:.0f} MB) and restart now?",
+        ):
+            self._start_update(upd)
+
+    def _start_update(self, upd) -> None:
+        if not updater.is_frozen():
+            webbrowser.open(updater.RELEASES_PAGE)  # source run can't self-replace
+            self.log("Opened the releases page (source run can't self-update).")
+            return
+        if self._running:
+            messagebox.showwarning(APP_TITLE, "Stop the current run before updating.")
+            return
+        self._update_busy = True
+        dest = updater.new_exe_path()
+        self.log(f"Downloading update v{upd.version} ...")
+        last = [0]
+
+        def prog(frac: float) -> None:
+            pct = int(frac * 100)
+            if pct >= last[0] + 10:
+                last[0] = pct
+                self.log(f"Downloading update ... {pct}%")
+
+        def work() -> None:
+            ok = updater.download(upd, dest, prog)
+            self._ui_queue.put(lambda: self._finish_update(ok, dest, upd))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_update(self, ok: bool, dest, upd) -> None:
+        self._update_busy = False
+        if not ok:
+            messagebox.showerror(
+                APP_TITLE, "Download failed. Opening the releases page instead."
+            )
+            webbrowser.open(updater.RELEASES_PAGE)
+            return
+        self.log("Update downloaded — restarting ...")
+        try:
+            updater.apply_and_restart(dest)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Could not apply update:\n{exc}")
+            webbrowser.open(updater.RELEASES_PAGE)
+            return
+        self._save_settings()
+        self.stop_event.set()
+        self.root.after(150, self.root.destroy)  # exit so the swap can proceed
 
     def _on_close(self) -> None:
         self._save_settings()

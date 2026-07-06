@@ -22,6 +22,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import win32api
+import win32gui
 
 from . import bot
 from . import capture
@@ -71,7 +72,13 @@ class App:
         self._log_lines: list[tuple[str, str]] = []  # (message, tag)
         self._log_text: tk.Text | None = None        # set while the modal is open
         self._log_win: tk.Toplevel | None = None
-        self._new_log_since_open = False             # unseen lines since last view
+
+        # Worker threads never touch Tk directly: they queue a callable here and
+        # _drain_log (on the Tk thread) runs it. Keeps all widget access on-thread.
+        self._ui_queue: "queue.Queue" = queue.Queue()
+        self._dry_busy = False   # a dry-run capture/match thread is in flight
+        self._run_gen = 0        # per-run token so a stale Esc watcher exits
+        self._preview_win: tk.Toplevel | None = None
 
         self._saved = config.load()
         # store  = every gift found in assets/ (the full library)
@@ -95,9 +102,10 @@ class App:
         self._fit_window()
         self.root.after(100, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Esc cancels a run when the app itself has focus; a global watcher
-        # (see _watch_escape) covers the case where the target window is on top.
-        self.root.bind_all("<Escape>", lambda _e: self._esc_stop())
+        # Esc cancels a run when GiftDrop has focus; _watch_escape covers the
+        # case where the target window is on top. Bound to root only (not
+        # bind_all) so modal Esc-to-close doesn't also abort the run.
+        self.root.bind("<Escape>", lambda _e: self._esc_stop())
 
     # ---- styling ---------------------------------------------------------
     def _setup_style(self) -> None:
@@ -220,16 +228,18 @@ class App:
 
     def _fit_window(self, *, grow_only: bool = False) -> None:
         """Size the window to its natural content height so the action buttons
-        are never clipped, regardless of display scaling. ``grow_only`` never
-        shrinks below the current size (used after the bar gains tiles)."""
+        are never clipped, regardless of display scaling. ``grow_only`` keeps the
+        current outer size (used after the bar gains tiles) but ``minsize`` always
+        tracks the natural height so the window can still be shrunk after unpin."""
         self.root.update_idletasks()
         w = max(self.root.winfo_reqwidth(), 540)
         h = self.root.winfo_reqheight()
+        gw, gh = w, h
         if grow_only and self.root.winfo_ismapped():
-            w = max(w, self.root.winfo_width())
-            h = max(h, self.root.winfo_height())
-        self.root.geometry(f"{w}x{h}")
-        self.root.minsize(w, h)
+            gw = max(w, self.root.winfo_width())
+            gh = max(h, self.root.winfo_height())
+        self.root.geometry(f"{gw}x{gh}")
+        self.root.minsize(w, h)  # natural size, not monotonic
 
     def _card(self, *, expand: bool = False) -> ttk.Frame:
         """A flat white card on the base background. Separation comes from the
@@ -435,6 +445,8 @@ class App:
 
     def _add_shortcut(self, gift: "gifts.Gift") -> bool:
         """Pin a store gift to the bar. Returns False if the bar is full."""
+        if self._running:
+            return True  # no change while sending
         if any(g.icon_path == gift.icon_path for g in self.shortcuts):
             return True
         if len(self.shortcuts) >= self.MAX_SHORTCUTS:
@@ -456,6 +468,7 @@ class App:
         if self.current_gift == gift:
             self.current_gift = self.shortcuts[0] if self.shortcuts else None
         self._render_gift_list()
+        self._fit_window()  # bar shrank -> reclaim the space
         self._save_settings()
         if self._store_win is not None and self._store_win.winfo_exists():
             self._render_store_body()
@@ -489,6 +502,7 @@ class App:
             (g for g in self.shortcuts if g.icon_path.stem == stem), None
         ) or (self.shortcuts[0] if self.shortcuts else None)
         self._render_gift_list()
+        self._fit_window()  # bar may have shrunk
         self._save_settings()
         if self._store_win is not None and self._store_win.winfo_exists():
             self._render_store_body()
@@ -743,7 +757,10 @@ class App:
             stem = stem[: -len("-send")]
         base = self._slug(stem) or "gift"
         slug, n = base, 2
-        while (gifts.ASSETS_DIR / f"{slug}.png").exists():
+        while (
+            (gifts.ASSETS_DIR / f"{slug}.png").exists()
+            or (gifts.ASSETS_DIR / f"{slug}-send.png").exists()
+        ):
             slug, n = f"{base}-{n}", n + 1
         return slug
 
@@ -825,13 +842,21 @@ class App:
                 self._append_log(msg, self._tag_for(msg))
         except queue.Empty:
             pass
+        # Run any UI work queued by worker threads (Tk touched only here).
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
         # Re-enable Start when the worker finishes.
         if self.worker is not None and not self.worker.is_alive():
             self.worker = None
             self.start_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
             self._set_running(False)
-            self._set_status("idle")
+            # Keep "Stopped" visible when the run was cancelled; a clean finish
+            # (stop_event never set) returns to "Idle".
+            self._set_status("stopped" if self.stop_event.is_set() else "idle")
         self.root.after(100, self._drain_log)
 
     def _open_log_modal(self) -> None:
@@ -904,14 +929,29 @@ class App:
         win.geometry(f"+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
 
     def refresh_windows(self) -> None:
+        prev_hwnd = self._selected_hwnd_quiet()
         self.windows = capture.list_windows(skip_titles=(APP_TITLE,))
         labels = [f"{title}  [hwnd {hwnd}]" for hwnd, title in self.windows]
         self.window_combo["values"] = labels
-        if labels:
-            if self.window_combo.current() < 0:  # nothing valid selected yet
-                self.window_combo.current(0)
-        else:
+        if not labels:
             self.window_var.set("No windows found — click Refresh")
+            return
+        # Keep the same target across refreshes; only default to 0 on first load.
+        hwnds = [hwnd for hwnd, _ in self.windows]
+        if prev_hwnd in hwnds:
+            self.window_combo.current(hwnds.index(prev_hwnd))
+        elif prev_hwnd is None:
+            self.window_combo.current(0)  # first load / nothing was selected
+        else:
+            # Previous target vanished; clear rather than silently retarget.
+            self.window_combo.set("")
+
+    def _selected_hwnd_quiet(self) -> int | None:
+        """Currently selected hwnd, or None — without warning popups."""
+        idx = self.window_combo.current()
+        if 0 <= idx < len(self.windows):
+            return self.windows[idx][0]
+        return None
 
     def _selected_hwnd(self) -> int | None:
         idx = self.window_combo.current()
@@ -947,6 +987,7 @@ class App:
         self.window_combo.configure(state="disabled" if running else "readonly")
         self.refresh_btn.configure(state=state)
         self.dry_btn.configure(state=state)
+        self.store_btn.configure(state=state)
         self.unlimited_chk.configure(state=state)
         for entry in self._param_entries:
             entry.configure(state=state)
@@ -954,7 +995,7 @@ class App:
             self._apply_unlimited()  # keep Count greyed if Unlimited is still on
 
     def start(self) -> None:
-        if self.worker is not None:
+        if self.worker is not None or self._dry_busy:
             return
         hwnd = self._selected_hwnd()
         if hwnd is None:
@@ -994,19 +1035,34 @@ class App:
             daemon=True,
         )
         self.worker.start()
-        threading.Thread(target=self._watch_escape, daemon=True).start()
+        self._run_gen += 1
+        threading.Thread(
+            target=self._watch_escape, args=(hwnd, self._run_gen), daemon=True
+        ).start()
 
-    def _watch_escape(self) -> None:
-        """Poll the Esc key globally so a run can be aborted even while the
-        target window (not GiftDrop) holds the foreground."""
+    def _watch_escape(self, hwnd: int, gen: int) -> None:
+        """Poll Esc so a run can be aborted while the target window is on top.
+        Runs on a worker thread, so it must NOT touch Tk: it only sets the
+        thread-safe ``stop_event`` (and ``log`` is queue-backed). ``gen`` retires
+        a stale watcher if a new run starts. Esc is honoured only while the
+        target window is foreground, so unrelated app Esc-presses don't cancel."""
         VK_ESCAPE = 0x1B
-        while self._running and not self.stop_event.is_set():
-            if win32api.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
-                self.root.after(0, self._esc_stop)
+        while (
+            self._run_gen == gen
+            and self._running
+            and not self.stop_event.is_set()
+        ):
+            if (
+                win32gui.GetForegroundWindow() == hwnd
+                and win32api.GetAsyncKeyState(VK_ESCAPE) & 0x8000
+            ):
+                self.log("Esc pressed — cancelling.")
+                self.stop_event.set()  # thread-safe; worker exits, _drain_log reacts
                 return
             time.sleep(0.05)
 
     def _esc_stop(self) -> None:
+        """Esc handler on the Tk thread (root binding), for when GiftDrop has focus."""
         if self._running:
             self.log("Esc pressed — cancelling.")
             self.stop()
@@ -1019,10 +1075,11 @@ class App:
     def dry_run(self) -> None:
         """Capture the selected window, detect without clicking, show an overlay.
 
-        Capture + match run on a background thread so the UI stays responsive;
-        the preview window is created back on the Tk thread via ``after``.
+        Capture + match run on a background thread so the UI stays responsive.
+        The thread never touches Tk: it queues the result on ``_ui_queue`` for
+        ``_drain_log`` to render on the Tk thread.
         """
-        if self._running:
+        if self._running or self._dry_busy:
             return
         hwnd = self._selected_hwnd()
         if hwnd is None:
@@ -1035,6 +1092,7 @@ class App:
             return
         _, _, _, threshold = params
         gift = self.current_gift
+        self._dry_busy = True
         self.dry_btn.configure(state="disabled")
         self.log(f"Dry-run ({gift.name}): detecting icon (no click)...")
 
@@ -1045,23 +1103,28 @@ class App:
                 match = matcher.find(image, icon_tpl, threshold=threshold)
             except Exception as exc:  # noqa: BLE001 - surface any capture/match error
                 self.log(f"Dry-run error: {exc}")
-                self.root.after(0, lambda: self.dry_btn.configure(state="normal"))
+                self._ui_queue.put(self._end_dry_run)
                 return
             if match is None:
                 self.log("Dry-run: icon NOT found. Lower Threshold or check the window.")
-                self.root.after(0, lambda: self.dry_btn.configure(state="normal"))
+                self._ui_queue.put(self._end_dry_run)
                 return
             self.log(
                 f"Dry-run: icon found at window ({match.cx},{match.cy}) "
                 f"score {match.score:.2f}."
             )
-            self.root.after(0, lambda: self._finish_dry_run(image, match))
+            self._ui_queue.put(lambda: self._end_dry_run(image, match))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_dry_run(self, image, match) -> None:
-        self.dry_btn.configure(state="normal")
-        self._show_preview(image, match)
+    def _end_dry_run(self, image=None, match=None) -> None:
+        """Runs on the Tk thread. Clears the busy flag; re-enables Dry-run only
+        if a real run hasn't since taken over the button state."""
+        self._dry_busy = False
+        if not self._running:
+            self.dry_btn.configure(state="normal")
+        if image is not None and match is not None:
+            self._show_preview(image, match)
 
     def _show_preview(self, image, match) -> None:
         from PIL import ImageDraw, ImageTk
@@ -1081,13 +1144,18 @@ class App:
                 (int(preview.width * scale), int(preview.height * scale))
             )
 
+        # Reuse one preview window instead of piling up Toplevels/PhotoImages.
+        if self._preview_win is not None and self._preview_win.winfo_exists():
+            self._preview_win.destroy()
         win = tk.Toplevel(self.root)
         win.title("Dry-run preview")
         win.configure(bg=BG)
+        win.bind("<Escape>", lambda _e: win.destroy())
         photo = ImageTk.PhotoImage(preview)
         label = tk.Label(win, image=photo, bg=BG, bd=0)
         label.image = photo  # keep a reference
         label.pack(padx=PAD, pady=PAD)
+        self._preview_win = win
 
     def _on_close(self) -> None:
         self._save_settings()

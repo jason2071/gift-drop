@@ -39,5 +39,5 @@ def save(data: dict) -> None:
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass

@@ -7,21 +7,61 @@ This is what lets the bot locate the gift icon on an occluded target window.
 
 from __future__ import annotations
 
+import ctypes
+import os
+from ctypes import wintypes
+
 from PIL import Image
 import win32con
 import win32gui
+import win32process
 import win32ui
 
 # Undocumented PrintWindow flag: render the full window content (including
 # DWM/Chromium-composited surfaces) even when occluded. Supported Win 8.1+.
 PW_RENDERFULLCONTENT = 0x00000002
 
+# Executable names treated as browsers for the target-window list.
+BROWSER_EXES = frozenset({
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "opera_gx.exe", "vivaldi.exe", "chromium.exe", "iexplore.exe", "arc.exe",
+    "browser.exe",  # Yandex
+})
 
-def list_windows(skip_titles: tuple[str, ...] = ()) -> list[tuple[int, str]]:
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _process_exe(hwnd: int) -> str:
+    """Lower-cased executable basename that owns ``hwnd`` (``""`` if unknown)."""
+    try:
+        _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+        handle = ctypes.windll.kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(len(buf))
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size)
+            ):
+                return os.path.basename(buf.value).lower()
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - a bad hwnd/pid must not break enumeration
+        pass
+    return ""
+
+
+def list_windows(
+    skip_titles: tuple[str, ...] = (), browsers_only: bool = True
+) -> list[tuple[int, str]]:
     """Return ``[(hwnd, title)]`` for visible top-level windows with a title.
 
-    ``skip_titles`` lets the caller drop its own window (matched by exact title)
-    so the bot never targets itself.
+    ``skip_titles`` drops the caller's own window (matched by exact title) so the
+    bot never targets itself. When ``browsers_only`` is set (default), only
+    windows owned by a known browser process are returned.
     """
     windows: list[tuple[int, str]] = []
 
@@ -29,9 +69,9 @@ def list_windows(skip_titles: tuple[str, ...] = ()) -> list[tuple[int, str]]:
         if not win32gui.IsWindowVisible(hwnd):
             return
         title = win32gui.GetWindowText(hwnd)
-        if not title:
+        if not title or title in skip_titles:
             return
-        if title in skip_titles:
+        if browsers_only and _process_exe(hwnd) not in BROWSER_EXES:
             return
         windows.append((hwnd, title))
 

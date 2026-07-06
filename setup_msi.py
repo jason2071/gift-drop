@@ -21,7 +21,11 @@ build_exe_options = {
         "pyautogui",
     ],
     "include_files": [("assets/", "assets/")],
-    "excludes": ["tkinter.test", "test", "unittest"],
+    "excludes": [
+        "tkinter.test", "test", "unittest",
+        "PyQt5", "PyQt6", "PySide2", "PySide6",
+        "scipy", "pandas", "matplotlib", "IPython", "notebook",
+    ],
     "optimize": 1,
 }
 

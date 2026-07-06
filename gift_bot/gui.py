@@ -3,9 +3,11 @@
 The bot loop runs on a background thread; log messages come back through a queue
 that the Tk main loop drains, keeping the UI responsive and thread-safe.
 
-The look is a hand-rolled light theme (Catppuccin Latte palette) built on ttk's
-``clam`` base theme, which -- unlike the native Windows themes -- honours custom
-background/foreground colours on widgets.
+The look is a minimal light theme built on ttk's ``clam`` base theme, which --
+unlike the native Windows themes -- honours custom colours on widgets. Design
+intent: flat surfaces separated by whitespace (no nested borders), one accent
+colour, weight over colour for hierarchy, and colour reserved for state
+(status, errors) rather than decoration.
 """
 
 from __future__ import annotations
@@ -14,48 +16,50 @@ import queue
 import re
 import shutil
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import win32api
+
 from . import bot
 from . import capture
+from . import config
 from . import gifts
 from . import matcher
 
 APP_TITLE = "GiftDrop"
 
 
-# --- palette (Catppuccin Latte) ------------------------------------------
+# --- palette --------------------------------------------------------------
 BG = "#eff1f5"        # window base
-SURFACE = "#ffffff"   # card background
-SURFACE2 = "#e6e9ef"  # inputs / raised
-BORDER = "#bcc0cc"
-TEXT = "#4c4f69"
-MUTED = "#7c7f93"
-ACCENT = "#1e66f5"    # blue
+SURFACE = "#ffffff"   # card / tile surface
+SURFACE2 = "#e6e9ef"  # input fill
+BORDER = "#cdd0da"    # hairline separators / tile edges
+TEXT = "#4c4f69"      # primary text
+MUTED = "#8c8fa1"     # secondary text
+ACCENT = "#1e66f5"    # single accent (primary action, selection, focus)
 ACCENT_HI = "#3b7bff"
-BTN_FG = "#ffffff"    # text on coloured buttons
-GREEN = "#2f8132"     # deep enough for white button text + log (WCAG AA)
-GREEN_HI = "#3d9e3f"
-RED = "#d20f39"
-RED_HI = "#e11d48"
-CROSSHAIR = "#d20f39"
-LOG_INFO = "#5a5d70"  # readable muted on the white log surface
+BTN_FG = "#ffffff"
+GREEN = "#2f8132"     # state only: running
+RED = "#d20f39"       # state only: stopped / error
+LOG_INFO = "#5a5d70"
 
 FONT = ("Segoe UI", 10)
 FONT_SM = ("Segoe UI", 9)
 FONT_BOLD = ("Segoe UI Semibold", 10)
-FONT_TITLE = ("Segoe UI Semibold", 16)
+FONT_TITLE = ("Segoe UI Semibold", 13)
 FONT_MONO = ("Cascadia Mono", 9)
+
+PAD = 12   # base spacing unit
+GAP = 6    # gap between stacked cards
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("580x620")
-        root.minsize(520, 520)
         root.configure(bg=BG)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -63,17 +67,37 @@ class App:
         self.worker: threading.Thread | None = None
         self.windows: list[tuple[int, str]] = []
 
-        self.gifts: list[gifts.Gift] = gifts.discover()
-        self.current_gift: gifts.Gift | None = self.gifts[0] if self.gifts else None
-        self._thumb_photo = None          # keep a ref for the current-gift thumbnail
-        self._picker_photos: list = []    # keep refs for picker thumbnails
+        # Log lives in a modal; buffer entries so it survives open/close.
+        self._log_lines: list[tuple[str, str]] = []  # (message, tag)
+        self._log_text: tk.Text | None = None        # set while the modal is open
+        self._log_win: tk.Toplevel | None = None
+        self._new_log_since_open = False             # unseen lines since last view
+
+        self._saved = config.load()
+        # store  = every gift found in assets/ (the full library)
+        # shortcuts = the curated subset pinned to the main "Gift to send" bar
+        self.store: list[gifts.Gift] = gifts.discover()
+        self.shortcuts: list[gifts.Gift] = self._load_shortcuts()
+        saved_gift = self._saved.get("gift")
+        self.current_gift: gifts.Gift | None = next(
+            (g for g in self.shortcuts if g.icon_path.stem == saved_gift), None
+        ) or (self.shortcuts[0] if self.shortcuts else None)
+
+        self._list_photos: list = []      # keep refs for shortcut-bar thumbnails
+        self._store_photos: list = []     # keep refs for store-modal thumbnails
+        self._store_win: tk.Toplevel | None = None
+        self._store_body: tk.Widget | None = None
         self._running = False             # a send worker is active -> lock inputs
 
         self._setup_style()
         self._build_ui()
         self.refresh_windows()
+        self._fit_window()
         self.root.after(100, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Esc cancels a run when the app itself has focus; a global watcher
+        # (see _watch_escape) covers the case where the target window is on top.
+        self.root.bind_all("<Escape>", lambda _e: self._esc_stop())
 
     # ---- styling ---------------------------------------------------------
     def _setup_style(self) -> None:
@@ -85,6 +109,10 @@ class App:
         style.configure("Card.TFrame", background=SURFACE)
         style.configure("TLabel", background=BG, foreground=TEXT, font=FONT)
         style.configure("Card.TLabel", background=SURFACE, foreground=TEXT, font=FONT)
+        # Section heading: weight, not colour or caps.
+        style.configure(
+            "Heading.TLabel", background=SURFACE, foreground=TEXT, font=FONT_BOLD
+        )
         style.configure(
             "Field.TLabel", background=SURFACE, foreground=MUTED, font=FONT_SM
         )
@@ -94,164 +122,159 @@ class App:
         style.configure(
             "Subtitle.TLabel", background=BG, foreground=MUTED, font=FONT_SM
         )
+        # Title on a card surface (dialogs sit on BG; picker titles reuse Title).
         style.configure(
-            "Heading.TLabel", background=SURFACE, foreground=ACCENT, font=FONT_BOLD
-        )
-        style.configure(
-            "Status.TLabel", background=SURFACE2, foreground=MUTED, font=FONT_SM
+            "CardHint.TLabel", background=SURFACE, foreground=MUTED, font=FONT_SM
         )
 
-        # Entry / Combobox
+        # Entry / Combobox: filled field, border only on focus.
         style.configure(
             "TEntry",
             fieldbackground=SURFACE2,
             foreground=TEXT,
             insertcolor=TEXT,
-            bordercolor=BORDER,
-            lightcolor=BORDER,
-            darkcolor=BORDER,
+            bordercolor=SURFACE2,
+            lightcolor=SURFACE2,
+            darkcolor=SURFACE2,
             borderwidth=1,
-            padding=4,
+            padding=5,
         )
-        style.map("TEntry", bordercolor=[("focus", ACCENT)])
+        style.map("TEntry", bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
         style.configure(
             "TCombobox",
             fieldbackground=SURFACE2,
             background=SURFACE2,
             foreground=TEXT,
             arrowcolor=TEXT,
-            bordercolor=BORDER,
-            lightcolor=BORDER,
-            darkcolor=BORDER,
+            bordercolor=SURFACE2,
+            lightcolor=SURFACE2,
+            darkcolor=SURFACE2,
             borderwidth=1,
-            padding=4,
+            padding=5,
         )
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", SURFACE2)],
             bordercolor=[("focus", ACCENT), ("hover", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            darkcolor=[("focus", ACCENT)],
             foreground=[("readonly", TEXT)],
         )
 
-        # Buttons
+        # Buttons: one primary (accent), everything else quiet.
         style.configure(
             "TButton",
             background=SURFACE2,
             foreground=TEXT,
-            bordercolor=BORDER,
-            focuscolor=SURFACE2,
             borderwidth=0,
-            padding=(12, 7),
-            font=FONT_BOLD,
+            focuscolor=SURFACE2,
+            padding=(10, 5),
+            font=FONT_SM,
         )
         style.map(
             "TButton",
             background=[("active", BORDER), ("disabled", SURFACE)],
             foreground=[("disabled", MUTED)],
-            focuscolor=[("focus", ACCENT)],  # visible keyboard-focus ring
+            focuscolor=[("focus", ACCENT)],
         )
-        style.configure("Accent.TButton", background=ACCENT, foreground=BTN_FG)
+        style.configure("Primary.TButton", background=ACCENT, foreground=BTN_FG)
         style.map(
-            "Accent.TButton",
+            "Primary.TButton",
             background=[("active", ACCENT_HI), ("disabled", SURFACE2)],
             foreground=[("disabled", MUTED)],
             focuscolor=[("focus", BTN_FG)],
         )
-        style.configure("Start.TButton", background=GREEN, foreground=BTN_FG)
-        style.map(
-            "Start.TButton",
-            background=[("active", GREEN_HI), ("disabled", SURFACE2)],
-            foreground=[("disabled", MUTED)],
-            focuscolor=[("focus", BTN_FG)],
+
+        # Checkbutton on a card surface
+        style.configure(
+            "Card.TCheckbutton",
+            background=SURFACE,
+            foreground=TEXT,
+            focuscolor=SURFACE,
+            font=FONT_SM,
         )
-        style.configure("Stop.TButton", background=RED, foreground=BTN_FG)
         style.map(
-            "Stop.TButton",
-            background=[("active", RED_HI), ("disabled", SURFACE2)],
+            "Card.TCheckbutton",
+            background=[("active", SURFACE)],
             foreground=[("disabled", MUTED)],
-            focuscolor=[("focus", BTN_FG)],
         )
 
         # Scrollbar
         style.configure(
             "Vertical.TScrollbar",
             background=SURFACE2,
-            troughcolor=BG,
-            bordercolor=BG,
+            troughcolor=SURFACE,
+            bordercolor=SURFACE,
             arrowcolor=MUTED,
             borderwidth=0,
         )
         style.map("Vertical.TScrollbar", background=[("active", BORDER)])
 
-        # The Combobox popdown is a plain Tk Listbox that ignores ttk styling;
-        # theme it via the option database so it matches the palette.
+        # The Combobox popdown is a plain Tk Listbox that ignores ttk styling.
         self.root.option_add("*TCombobox*Listbox.background", SURFACE2)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.root.option_add("*TCombobox*Listbox.selectForeground", BTN_FG)
         self.root.option_add("*TCombobox*Listbox.font", FONT_SM)
 
-    def _card(self, parent: tk.Widget) -> tk.Widget:
-        """A rounded-ish padded surface. tk lacks true rounded corners, so we
-        fake depth with a padded frame on a distinct background."""
-        outer = tk.Frame(parent, bg=BORDER, bd=0)
-        outer.pack(fill="x", padx=14, pady=6)
-        inner = ttk.Frame(outer, style="Card.TFrame", padding=12)
-        inner.pack(fill="x", padx=1, pady=1)
-        return inner
+    def _fit_window(self, *, grow_only: bool = False) -> None:
+        """Size the window to its natural content height so the action buttons
+        are never clipped, regardless of display scaling. ``grow_only`` never
+        shrinks below the current size (used after the bar gains tiles)."""
+        self.root.update_idletasks()
+        w = max(self.root.winfo_reqwidth(), 540)
+        h = self.root.winfo_reqheight()
+        if grow_only and self.root.winfo_ismapped():
+            w = max(w, self.root.winfo_width())
+            h = max(h, self.root.winfo_height())
+        self.root.geometry(f"{w}x{h}")
+        self.root.minsize(w, h)
+
+    def _card(self, *, expand: bool = False) -> ttk.Frame:
+        """A flat white card on the base background. Separation comes from the
+        surface/background contrast plus whitespace -- no borders."""
+        card = ttk.Frame(self.root, style="Card.TFrame", padding=PAD)
+        card.pack(
+            fill="both" if expand else "x",
+            padx=PAD,
+            pady=(0, GAP),
+            expand=expand,
+        )
+        return card
 
     # ---- UI construction -------------------------------------------------
     def _build_ui(self) -> None:
         # Header --------------------------------------------------------
         header = ttk.Frame(self.root)
-        header.pack(fill="x", padx=14, pady=(14, 4))
-        ttk.Label(header, text="🎁  GiftDrop", style="Title.TLabel").pack(
-            side="left"
-        )
+        header.pack(fill="x", padx=PAD, pady=(PAD, GAP))
+        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         ttk.Label(
-            header,
-            text="TikTok gift-send macro",
-            style="Subtitle.TLabel",
-        ).pack(side="left", padx=(10, 0), pady=(8, 0))
-
-        self.status_pill = tk.Frame(header, bg=SURFACE2)
-        self.status_pill.pack(side="right", ipadx=8, ipady=3)
-        self.status_dot = tk.Canvas(
-            self.status_pill, width=10, height=10, bg=SURFACE2, highlightthickness=0
-        )
-        self.status_dot.pack(side="left", padx=(6, 4))
-        self.status_label = ttk.Label(
-            self.status_pill, text="Idle", style="Status.TLabel"
-        )
-        self.status_label.pack(side="left", padx=(0, 6))
+            header, text="TikTok gift-send macro", style="Subtitle.TLabel"
+        ).pack(side="left", padx=(10, 0))
+        self.status_label = tk.Label(header, bg=BG, font=FONT_SM, fg=MUTED)
+        self.status_label.pack(side="right")
         self._set_status("idle")
 
-        # Gift card -----------------------------------------------------
-        gift_card = self._card(self.root)
-        ttk.Label(gift_card, text="GIFT TO SEND", style="Heading.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        # Gift card: inline list, click a gift to make it active ---------
+        gift_card = self._card()
+        gift_head = ttk.Frame(gift_card, style="Card.TFrame")
+        gift_head.pack(fill="x", pady=(0, 8))
+        ttk.Label(gift_head, text="Gift to send", style="Heading.TLabel").pack(
+            side="left"
         )
-        self.gift_thumb = tk.Label(gift_card, bg=SURFACE2, cursor="hand2", bd=0)
-        self.gift_thumb.grid(row=1, column=0, rowspan=2, padx=(0, 12))
-        self.gift_name_lbl = ttk.Label(
-            gift_card, text="", style="Card.TLabel", font=FONT_BOLD, cursor="hand2"
+        self.store_btn = ttk.Button(
+            gift_head, text="Store gift", command=self._open_store_modal
         )
-        self.gift_name_lbl.grid(row=1, column=1, sticky="sw")
-        self.gift_hint_lbl = ttk.Label(
-            gift_card, text="", style="Field.TLabel", cursor="hand2"
-        )
-        self.gift_hint_lbl.grid(row=2, column=1, sticky="nw")
-        gift_card.columnconfigure(1, weight=1)
-        for w in (self.gift_thumb, self.gift_name_lbl, self.gift_hint_lbl):
-            w.bind(
-                "<Button-1>",
-                lambda _e: None if self._running else self._open_gift_picker(),
-            )
-        self._render_current_gift()
+        self.store_btn.pack(side="right")
+        self.gift_list = ttk.Frame(gift_card, style="Card.TFrame")
+        self.gift_list.pack(fill="x")
+        self._list_photos: list = []
+        self._render_gift_list()
 
         # Target card ---------------------------------------------------
-        target = self._card(self.root)
-        ttk.Label(target, text="TARGET WINDOW", style="Heading.TLabel").grid(
+        target = self._card()
+        ttk.Label(target, text="Target window", style="Heading.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", pady=(0, 8)
         )
         self.window_var = tk.StringVar()
@@ -260,101 +283,69 @@ class App:
         )
         self.window_combo.grid(row=1, column=0, columnspan=3, sticky="we")
         self.refresh_btn = ttk.Button(
-            target, text="⟳ Refresh", command=self.refresh_windows
+            target, text="Refresh", command=self.refresh_windows
         )
-        self.refresh_btn.grid(row=1, column=3, sticky="e", padx=(8, 0))
+        self.refresh_btn.grid(row=1, column=3, sticky="e", padx=(GAP, 0))
         target.columnconfigure(0, weight=1)
 
         # Parameters card ----------------------------------------------
-        params = self._card(self.root)
-        ttk.Label(params, text="PARAMETERS", style="Heading.TLabel").grid(
-            row=0, column=0, columnspan=6, sticky="w", pady=(0, 8)
+        params = self._card()
+        ttk.Label(params, text="Parameters", style="Heading.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
         )
+        self.unlimited_var = tk.BooleanVar(value=bool(self._saved.get("unlimited")))
+        self.unlimited_chk = ttk.Checkbutton(
+            params,
+            text="Unlimited count (send until Stop)",
+            style="Card.TCheckbutton",
+            variable=self.unlimited_var,
+            command=self._toggle_unlimited,
+        )
+        self.unlimited_chk.grid(row=0, column=1, columnspan=3, sticky="e", pady=(0, 8))
 
-        self.interval_var = tk.StringVar(value="2")
-        self.count_var = tk.StringVar(value="1")
-        self.threshold_var = tk.StringVar(value="0.8")
-        self.retries_var = tk.StringVar(value="3")
+        self.interval_var = tk.StringVar(value=str(self._saved.get("interval", "2")))
+        self.count_var = tk.StringVar(value=str(self._saved.get("count", "1")))
+        self.threshold_var = tk.StringVar(
+            value=str(self._saved.get("threshold", "0.8"))
+        )
+        self.retries_var = tk.StringVar(value=str(self._saved.get("retries", "3")))
 
         self._param_entries: list[ttk.Entry] = []
         self._field(params, "Interval (s)", self.interval_var, row=1, col=0)
-        self._field(params, "Count", self.count_var, row=1, col=2)
+        self.count_entry = self._field(params, "Count", self.count_var, row=1, col=2)
         self._field(params, "Threshold", self.threshold_var, row=2, col=0)
         self._field(params, "Retries", self.retries_var, row=2, col=2)
         for c in (1, 3):
             params.columnconfigure(c, weight=1)
+        self._apply_unlimited()  # reflect the loaded value on the Count field
 
         # Action buttons -----------------------------------------------
         buttons = ttk.Frame(self.root)
-        buttons.pack(fill="x", padx=14, pady=(6, 4))
+        buttons.pack(fill="x", padx=PAD, pady=(0, GAP))
         self.start_btn = ttk.Button(
-            buttons, text="▶  Start", style="Start.TButton", command=self.start
+            buttons, text="Start", style="Primary.TButton", command=self.start
         )
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(
-            buttons,
-            text="■  Stop",
-            style="Stop.TButton",
-            command=self.stop,
-            state="disabled",
+            buttons, text="Stop", command=self.stop, state="disabled"
         )
-        self.stop_btn.pack(side="left", padx=8)
-        self.dry_btn = ttk.Button(
-            buttons, text="🔍  Dry-run", style="Accent.TButton", command=self.dry_run
-        )
+        self.stop_btn.pack(side="left", padx=GAP)
+        self.dry_btn = ttk.Button(buttons, text="Dry-run", command=self.dry_run)
         self.dry_btn.pack(side="left")
-
-        # Log card ------------------------------------------------------
-        log_outer = tk.Frame(self.root, bg=BORDER)
-        log_outer.pack(fill="both", expand=True, padx=14, pady=(6, 14))
-        log_inner = tk.Frame(log_outer, bg=SURFACE)
-        log_inner.pack(fill="both", expand=True, padx=1, pady=1)
-
-        log_head = ttk.Frame(log_inner, style="Card.TFrame")
-        log_head.pack(fill="x", padx=12, pady=(10, 4))
-        ttk.Label(log_head, text="ACTIVITY LOG", style="Heading.TLabel").pack(
-            side="left"
+        ttk.Button(buttons, text="Log", command=self._open_log_modal).pack(
+            side="left", padx=GAP
         )
-        ttk.Button(log_head, text="Clear", command=self._clear_log).pack(side="right")
-
-        body = ttk.Frame(log_inner, style="Card.TFrame")
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.log_text = tk.Text(
-            body,
-            height=12,
-            state="disabled",
-            wrap="word",
-            bg=SURFACE,
-            fg=TEXT,
-            insertbackground=TEXT,
-            selectbackground=BORDER,
-            relief="flat",
-            font=FONT_MONO,
-            padx=8,
-            pady=6,
-            highlightthickness=0,
-        )
-        self.log_text.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(
-            body, style="Vertical.TScrollbar", command=self.log_text.yview
-        )
-        scroll.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=scroll.set)
-
-        # Coloured log tags (contrast-checked against the white log surface)
-        self.log_text.tag_configure("ok", foreground=GREEN)
-        self.log_text.tag_configure("err", foreground=RED)
-        self.log_text.tag_configure("info", foreground=LOG_INFO)
 
     def _field(
         self, parent: tk.Widget, label: str, var: tk.StringVar, *, row: int, col: int
-    ) -> None:
+    ) -> ttk.Entry:
         ttk.Label(parent, text=label, style="Field.TLabel").grid(
-            row=row, column=col, sticky="w", padx=(0, 6), pady=4
+            row=row, column=col, sticky="w", padx=(0, GAP), pady=4
         )
         entry = ttk.Entry(parent, textvariable=var, width=8)
-        entry.grid(row=row, column=col + 1, sticky="w", padx=(0, 16), pady=4)
+        entry.grid(row=row, column=col + 1, sticky="w", padx=(0, PAD), pady=4)
         self._param_entries.append(entry)
+        return entry
 
     def _set_status(self, state: str) -> None:
         colors = {
@@ -363,9 +354,7 @@ class App:
             "stopped": (RED, "Stopped"),
         }
         color, text = colors.get(state, (MUTED, "Idle"))
-        self.status_dot.delete("all")
-        self.status_dot.create_oval(1, 1, 9, 9, fill=color, outline=color)
-        self.status_label.configure(text=text)
+        self.status_label.configure(text=f"● {text}", fg=color)
 
     # ---- gift selection --------------------------------------------------
     def _load_thumb(self, path, size: int = 56):
@@ -376,229 +365,408 @@ class App:
         img.thumbnail((size, size))
         return ImageTk.PhotoImage(img)
 
-    def _render_current_gift(self) -> None:
-        if self.current_gift is None:
-            self.gift_thumb.configure(
-                image="", text="🎁", font=("Segoe UI", 26), fg=MUTED
-            )
-            self.gift_name_lbl.configure(text="No gift selected")
-            self.gift_hint_lbl.configure(text="click to add one  ›")
-            return
-        self._thumb_photo = self._load_thumb(self.current_gift.icon_path, 56)
-        self.gift_thumb.configure(image=self._thumb_photo, text="")
-        self.gift_name_lbl.configure(text=self.current_gift.name)
-        self.gift_hint_lbl.configure(text="click to change  ›")
+    def _load_shortcuts(self) -> list["gifts.Gift"]:
+        """Resolve saved shortcut slugs against the store. First run (no saved
+        list) pins every gift, up to the cap."""
+        by_stem = {g.icon_path.stem: g for g in self.store}
+        saved = self._saved.get("shortcuts")
+        if saved is None:
+            return self.store[: self.MAX_SHORTCUTS]
+        picked = [by_stem[s] for s in saved if s in by_stem]
+        return picked[: self.MAX_SHORTCUTS]
 
-    def _set_gift(self, gift: "gifts.Gift") -> None:
-        self.current_gift = gift
-        self._render_current_gift()
-        self.log(f"Selected gift: {gift.name}")
+    def _render_gift_list(self) -> None:
+        """(Re)build the shortcut-bar tiles. The active gift is the one that
+        will be sent; clicking makes it active, right-click unpins it."""
+        for w in self.gift_list.winfo_children():
+            w.destroy()
+        self._list_photos = []
 
-    def _open_gift_picker(self) -> None:
-        win = tk.Toplevel(self.root)
-        win.title("Choose a gift")
-        win.configure(bg=BG)
-        win.transient(self.root)
-        win.resizable(False, False)
-        win.bind("<Escape>", lambda _e: win.destroy())
-
-        header = ttk.Frame(win)
-        header.pack(fill="x", padx=16, pady=(14, 8))
-        ttk.Label(header, text="Choose a gift", style="Title.TLabel").pack(side="left")
-        ttk.Button(
-            header,
-            text="＋  Add gift",
-            style="Accent.TButton",
-            command=lambda: self._open_add_gift_dialog(win),
-        ).pack(side="right")
-
-        grid = ttk.Frame(win)
-        grid.pack(padx=16, pady=(0, 16))
-
-        if not self.gifts:
+        if not self.shortcuts:
             ttk.Label(
-                grid,
-                text="No gifts yet.  Click  ＋ Add gift  to upload one.",
-                style="Subtitle.TLabel",
-            ).pack(padx=30, pady=30)
+                self.gift_list,
+                text="No shortcuts — click Store gift to pin one.",
+                style="CardHint.TLabel",
+            ).grid(row=0, column=0, sticky="w", pady=4)
+            return
 
-        self._picker_photos = []
-        cols = 3
-        cell_w, cell_h = 116, 138
-        for i, g in enumerate(self.gifts):
-            photo = self._load_thumb(g.icon_path, 72)
-            self._picker_photos.append(photo)
-            selected = g == self.current_gift
-            border = ACCENT if selected else BORDER
+        # Thumbnail-only tiles, tight enough that the full bar (up to
+        # MAX_SHORTCUTS) fits on one row. Active gift = tile border. No labels.
+        side = 58
+        for i, g in enumerate(self.shortcuts):
+            photo = self._load_thumb(g.icon_path, side - 18)
+            self._list_photos.append(photo)
+            active = g == self.current_gift
 
-            # Fixed-size tile so the grid stays even regardless of name length.
-            cell = tk.Frame(
-                grid,
+            tile = tk.Frame(
+                self.gift_list,
                 bg=SURFACE,
                 cursor="hand2",
                 highlightthickness=2,
-                highlightbackground=border,
-                highlightcolor=border,
-                width=cell_w,
-                height=cell_h,
+                highlightbackground=(ACCENT if active else BORDER),
+                highlightcolor=(ACCENT if active else BORDER),
+                width=side,
+                height=side,
             )
-            cell.grid(row=i // cols, column=i % cols, padx=7, pady=7)
-            cell.pack_propagate(False)
+            tile.grid(row=0, column=i, padx=2, pady=2)
+            tile.grid_propagate(False)
+            tile.pack_propagate(False)
 
-            thumb = tk.Label(cell, image=photo, bg=SURFACE)
-            thumb.pack(pady=(16, 8))
-            caption = tk.Label(
-                cell,
-                text=("✓  " + g.name) if selected else g.name,
-                bg=SURFACE,
-                fg=(ACCENT if selected else TEXT),
-                font=(FONT_BOLD if selected else FONT_SM),
-                wraplength=cell_w - 16,
-                justify="center",
-            )
-            caption.pack()
+            thumb = tk.Label(tile, image=photo, bg=SURFACE)
+            thumb.pack(expand=True)
 
-            def on_enter(_e, c=cell, sel=selected):
-                if not sel:
-                    c.configure(highlightbackground=ACCENT, highlightcolor=ACCENT)
+            def on_enter(_e, t=tile, a=active):
+                if not a:
+                    t.configure(highlightbackground=MUTED, highlightcolor=MUTED)
 
-            def on_leave(_e, c=cell, sel=selected):
-                if not sel:
-                    c.configure(highlightbackground=BORDER, highlightcolor=BORDER)
+            def on_leave(_e, t=tile, a=active):
+                if not a:
+                    t.configure(highlightbackground=BORDER, highlightcolor=BORDER)
 
-            for child in (cell, thumb, caption):
-                child.bind(
-                    "<Button-1>",
-                    lambda _e, gg=g, ww=win: (self._set_gift(gg), ww.destroy()),
-                )
+            for child in (tile, thumb):
+                child.bind("<Button-1>", lambda _e, gg=g: self._set_gift(gg))
+                child.bind("<Button-3>", lambda _e, gg=g: self._remove_shortcut(gg))
                 child.bind("<Enter>", on_enter)
                 child.bind("<Leave>", on_leave)
 
-        # Centre the picker over the main window.
+        # Grow the window if the bar just got taller (e.g. first pin).
+        if hasattr(self, "start_btn"):
+            self._fit_window(grow_only=True)
+
+    def _add_shortcut(self, gift: "gifts.Gift") -> bool:
+        """Pin a store gift to the bar. Returns False if the bar is full."""
+        if any(g.icon_path == gift.icon_path for g in self.shortcuts):
+            return True
+        if len(self.shortcuts) >= self.MAX_SHORTCUTS:
+            return False
+        self.shortcuts.append(gift)
+        if self.current_gift is None:
+            self.current_gift = gift
+        self._render_gift_list()
+        self._save_settings()
+        return True
+
+    def _remove_shortcut(self, gift: "gifts.Gift") -> None:
+        """Unpin a gift from the bar. The gift stays in the store."""
+        if self._running:
+            return
+        self.shortcuts = [
+            g for g in self.shortcuts if g.icon_path != gift.icon_path
+        ]
+        if self.current_gift == gift:
+            self.current_gift = self.shortcuts[0] if self.shortcuts else None
+        self._render_gift_list()
+        self._save_settings()
+        if self._store_win is not None and self._store_win.winfo_exists():
+            self._render_store_body()
+
+    def _delete_gift(self, gift: "gifts.Gift") -> None:
+        """Permanently remove a gift from the store (deletes its PNGs) and drop
+        it from the shortcut bar."""
+        if self._running:
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"Delete '{gift.name}' from the store?\n\n"
+            f"Removes {gift.icon_path.name} and {gift.popup_path.name} "
+            "from assets/. This cannot be undone.",
+            parent=self._store_win or self.root,
+        ):
+            return
+        for p in (gift.icon_path, gift.popup_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                messagebox.showerror(APP_TITLE, f"Could not delete:\n{exc}")
+                return
+
+        stem = self.current_gift.icon_path.stem if self.current_gift else None
+        self.store = gifts.discover()
+        self.shortcuts = [
+            g for g in self.shortcuts if g.icon_path != gift.icon_path
+        ]
+        self.current_gift = next(
+            (g for g in self.shortcuts if g.icon_path.stem == stem), None
+        ) or (self.shortcuts[0] if self.shortcuts else None)
+        self._render_gift_list()
+        self._save_settings()
+        if self._store_win is not None and self._store_win.winfo_exists():
+            self._render_store_body()
+        self.log(f"Deleted gift: {gift.name}")
+
+    def _set_gift(self, gift: "gifts.Gift") -> None:
+        if self._running:
+            return  # don't switch the gift mid-send
+        self.current_gift = gift
+        self._render_gift_list()
+        self._save_settings()
+        self.log(f"Selected gift: {gift.name}")
+
+    def _save_settings(self) -> None:
+        config.save(
+            {
+                "interval": self.interval_var.get(),
+                "count": self.count_var.get(),
+                "threshold": self.threshold_var.get(),
+                "retries": self.retries_var.get(),
+                "unlimited": self.unlimited_var.get(),
+                "gift": self.current_gift.icon_path.stem if self.current_gift else None,
+                "shortcuts": [g.icon_path.stem for g in self.shortcuts],
+            }
+        )
+
+    def _apply_unlimited(self) -> None:
+        """Grey out the Count field when Unlimited is on (unless a run locked it)."""
+        if self._running:
+            return
+        self.count_entry.configure(
+            state="disabled" if self.unlimited_var.get() else "normal"
+        )
+
+    def _toggle_unlimited(self) -> None:
+        self._apply_unlimited()
+        self._save_settings()
+
+    # ---- gift store modal ------------------------------------------------
+    def _open_store_modal(self) -> None:
+        """Modal to manage the whole gift library: add, delete, pin/unpin."""
+        if self._store_win is not None and self._store_win.winfo_exists():
+            self._store_win.lift()
+            self._store_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Gift store")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.geometry("460x460")
+        self._store_win = win
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=PAD, pady=(PAD, GAP))
+        titles = ttk.Frame(head)
+        titles.pack(side="left", anchor="w")
+        ttk.Label(titles, text="Gift store", style="Title.TLabel").pack(anchor="w")
+        self.store_count = ttk.Label(titles, text="", style="Subtitle.TLabel")
+        self.store_count.pack(anchor="w")
+        ttk.Button(
+            head, text="Add gift", style="Primary.TButton",
+            command=self._open_add_gift_dialog,
+        ).pack(side="right", anchor="n")
+
+        # Scrollable list of every stored gift.
+        outer = tk.Frame(win, bg=SURFACE)
+        outer.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
+        canvas = tk.Canvas(outer, bg=SURFACE, highlightthickness=0)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(
+            outer, style="Vertical.TScrollbar", command=canvas.yview
+        )
+        sb.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=SURFACE)
+        canvas.create_window((0, 0), window=inner, anchor="nw", tags="inner")
+
+        def _resize(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig("inner", width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _resize)
+        canvas.bind("<Configure>", _resize)
+        canvas.bind(
+            "<MouseWheel>",
+            lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"),
+        )
+        self._store_body = inner
+
+        def on_close() -> None:
+            self._store_win = None
+            self._store_body = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.bind("<Escape>", lambda _e: on_close())
+
+        self._render_store_body()
+
         win.update_idletasks()
         w, h = win.winfo_width(), win.winfo_height()
         rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
         rw, rh = self.root.winfo_width(), self.root.winfo_height()
         win.geometry(f"+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
 
+    def _render_store_body(self) -> None:
+        body = self._store_body
+        if body is None:
+            return
+        for w in body.winfo_children():
+            w.destroy()
+        self._store_photos = []
+        self.store_count.configure(
+            text=f"{len(self.store)}/{self.MAX_STORE} in store · "
+            f"{len(self.shortcuts)}/{self.MAX_SHORTCUTS} pinned"
+        )
+
+        if not self.store:
+            ttk.Label(
+                body,
+                text="No gifts yet. Click Add gift to upload one.",
+                style="CardHint.TLabel",
+            ).pack(anchor="w", padx=8, pady=14)
+            return
+
+        pinned = {g.icon_path.stem for g in self.shortcuts}
+        bar_full = len(self.shortcuts) >= self.MAX_SHORTCUTS
+        for g in self.store:
+            row = tk.Frame(body, bg=SURFACE)
+            row.pack(fill="x", padx=4, pady=3)
+            photo = self._load_thumb(g.icon_path, 40)
+            self._store_photos.append(photo)
+            tk.Label(row, image=photo, bg=SURFACE).pack(side="left", padx=(2, 12))
+            tk.Label(row, text=g.name, bg=SURFACE, fg=TEXT, font=FONT).pack(
+                side="left"
+            )
+            ttk.Button(
+                row, text="Delete", command=lambda gg=g: self._delete_gift(gg)
+            ).pack(side="right", padx=(6, 0))
+            if g.icon_path.stem in pinned:
+                ttk.Button(
+                    row, text="Unpin", command=lambda gg=g: self._remove_shortcut(gg)
+                ).pack(side="right")
+            else:
+                pin_btn = ttk.Button(
+                    row, text="Pin", style="Primary.TButton",
+                    command=lambda gg=g: self._pin_from_store(gg),
+                )
+                if bar_full:
+                    pin_btn.configure(state="disabled")
+                pin_btn.pack(side="right")
+
+    def _pin_from_store(self, gift: "gifts.Gift") -> None:
+        if not self._add_shortcut(gift):
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Shortcut bar is full ({self.MAX_SHORTCUTS} max). Unpin one first.",
+                parent=self._store_win,
+            )
+            return
+        self._render_store_body()
+
     # ---- add / upload a gift ---------------------------------------------
-    def _open_add_gift_dialog(self, picker: "tk.Toplevel | None" = None) -> None:
-        """Dialog to browse an icon PNG + a send-popup PNG and register a gift."""
-        dlg = tk.Toplevel(self.root)
+    MAX_SHORTCUTS = 8   # tiles that fit on the one-row shortcut bar
+    MAX_STORE = 20      # total gifts kept in the library
+
+    def _open_add_gift_dialog(self) -> None:
+        """Dialog to browse an icon PNG + a send-popup PNG and store a gift."""
+        if len(self.store) >= self.MAX_STORE:
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Store is full ({self.MAX_STORE} max). Delete a gift first.",
+                parent=self._store_win or self.root,
+            )
+            return
+        parent = (
+            self._store_win
+            if self._store_win is not None and self._store_win.winfo_exists()
+            else self.root
+        )
+        dlg = tk.Toplevel(parent)
         dlg.title("Add a gift")
         dlg.configure(bg=BG)
-        dlg.transient(self.root)
+        dlg.transient(parent)
         dlg.resizable(False, False)
         dlg.grab_set()
 
         ttk.Label(dlg, text="Add a gift", style="Title.TLabel").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 4)
+            row=0, column=0, columnspan=3, sticky="w", padx=PAD, pady=(PAD, 2)
         )
         ttk.Label(
             dlg,
             text="Two PNGs: the gift icon, and the hover popup with the Send button.",
             style="Subtitle.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 10))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 14))
 
-        name_var = tk.StringVar()
         icon_var = tk.StringVar()
         send_var = tk.StringVar()
 
-        ttk.Label(dlg, text="Name", style="TLabel").grid(
-            row=2, column=0, sticky="w", padx=16, pady=6
-        )
-        name_entry = ttk.Entry(dlg, textvariable=name_var, width=32)
-        name_entry.grid(
-            row=2, column=1, columnspan=2, sticky="we", padx=(0, 16), pady=6
-        )
-
         def browse_row(row: int, label: str, var: tk.StringVar) -> None:
             ttk.Label(dlg, text=label, style="TLabel").grid(
-                row=row, column=0, sticky="w", padx=16, pady=6
+                row=row, column=0, sticky="w", padx=PAD, pady=6
             )
             entry = ttk.Entry(dlg, textvariable=var, width=26, state="readonly")
-            entry.grid(row=row, column=1, sticky="we", padx=(0, 8), pady=6)
+            entry.grid(row=row, column=1, sticky="we", padx=(0, GAP), pady=6)
             ttk.Button(
-                dlg,
-                text="Browse…",
-                command=lambda: self._browse_png(var, name_var),
-            ).grid(row=row, column=2, sticky="e", padx=(0, 16), pady=6)
+                dlg, text="Browse", command=lambda: self._browse_png(var)
+            ).grid(row=row, column=2, sticky="e", padx=(0, PAD), pady=6)
 
-        browse_row(3, "Gift icon", icon_var)
-        browse_row(4, "Send popup", send_var)
+        browse_row(2, "Gift icon", icon_var)
+        browse_row(3, "Send popup", send_var)
 
         def save() -> None:
-            self._save_gift(
-                name_var.get(), icon_var.get(), send_var.get(), dlg, picker
-            )
+            self._save_gift(icon_var.get(), send_var.get(), dlg)
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=5, column=0, columnspan=3, sticky="e", padx=16, pady=(12, 14))
+        btns.grid(row=4, column=0, columnspan=3, sticky="e", padx=PAD, pady=(14, PAD))
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
         ttk.Button(
-            btns, text="Save gift", style="Start.TButton", command=save
-        ).pack(side="right", padx=(0, 8))
+            btns, text="Save gift", style="Primary.TButton", command=save
+        ).pack(side="right", padx=(0, GAP))
         dlg.columnconfigure(1, weight=1)
 
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
         dlg.bind("<Return>", lambda _e: save())
-        name_entry.focus_set()
 
-        # Centre over the main window.
+        # Centre over the parent window.
         dlg.update_idletasks()
         w, h = dlg.winfo_width(), dlg.winfo_height()
-        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
-        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        rx, ry = parent.winfo_rootx(), parent.winfo_rooty()
+        rw, rh = parent.winfo_width(), parent.winfo_height()
         dlg.geometry(f"+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
 
-    def _browse_png(self, var: tk.StringVar, name_var: tk.StringVar) -> None:
+    def _browse_png(self, var: tk.StringVar) -> None:
         path = filedialog.askopenfilename(
             title="Select a PNG",
             filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
         )
-        if not path:
-            return
-        var.set(path)
-        # Prefill the name from the first file chosen, if still blank.
-        if not name_var.get():
-            stem = Path(path).stem
-            if stem.endswith("-send"):
-                stem = stem[: -len("-send")]
-            name_var.set(stem.replace("-", " ").replace("_", " ").title())
+        if path:
+            var.set(path)
 
     @staticmethod
     def _slug(name: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+        return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+    def _auto_slug(self, icon_path: str) -> str:
+        """Derive a unique, filesystem-safe slug for a new gift. Uses the icon's
+        filename, falling back to gift-N, and appends -N to avoid collisions."""
+        stem = Path(icon_path).stem
+        if stem.endswith("-send"):
+            stem = stem[: -len("-send")]
+        base = self._slug(stem) or "gift"
+        slug, n = base, 2
+        while (gifts.ASSETS_DIR / f"{slug}.png").exists():
+            slug, n = f"{base}-{n}", n + 1
         return slug
 
     def _save_gift(
         self,
-        name: str,
         icon_path: str,
         send_path: str,
         dlg: "tk.Toplevel",
-        picker: "tk.Toplevel | None",
     ) -> None:
-        if not name.strip():
-            messagebox.showwarning(APP_TITLE, "Enter a gift name.", parent=dlg)
-            return
         if not icon_path or not send_path:
             messagebox.showwarning(
                 APP_TITLE, "Choose both the icon and the send PNG.", parent=dlg
             )
             return
-        slug = self._slug(name)
-        if not slug:
-            messagebox.showwarning(APP_TITLE, "Name has no usable characters.", parent=dlg)
+        if len(self.store) >= self.MAX_STORE:
+            messagebox.showinfo(
+                APP_TITLE, f"Store is full ({self.MAX_STORE} max).", parent=dlg
+            )
             return
 
+        slug = self._auto_slug(icon_path)  # auto-generated, always unique
         dest_icon = gifts.ASSETS_DIR / f"{slug}.png"
         dest_send = gifts.ASSETS_DIR / f"{slug}-send.png"
-        if dest_icon.exists() or dest_send.exists():
-            if not messagebox.askyesno(
-                APP_TITLE, f"'{slug}' already exists. Overwrite?", parent=dlg
-            ):
-                return
         try:
             gifts.ASSETS_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(icon_path, dest_icon)
@@ -607,14 +775,17 @@ class App:
             messagebox.showerror(APP_TITLE, f"Could not save gift:\n{exc}", parent=dlg)
             return
 
-        self.gifts = gifts.discover()
-        new = next((g for g in self.gifts if g.icon_path == dest_icon), None)
-        if new is not None:
-            self._set_gift(new)
+        self.store = gifts.discover()
+        new = next((g for g in self.store if g.icon_path == dest_icon), None)
         dlg.destroy()
-        if picker is not None:
-            picker.destroy()
-            self._open_gift_picker()  # reopen to show the new gift
+        if new is not None:
+            pinned = self._add_shortcut(new)  # pin to the bar if there's room
+            self.log(
+                f"Stored gift: {new.name}"
+                + ("" if pinned else "  (bar full — pin it from the store)")
+            )
+        if self._store_win is not None and self._store_win.winfo_exists():
+            self._render_store_body()
 
     # ---- helpers ---------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -630,18 +801,28 @@ class App:
         return "info"
 
     def _clear_log(self) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        self._log_lines.clear()
+        if self._log_text is not None:
+            self._log_text.configure(state="normal")
+            self._log_text.delete("1.0", "end")
+            self._log_text.configure(state="disabled")
+
+    def _append_log(self, msg: str, tag: str) -> None:
+        """Append one line to the buffer and, if the modal is open, to its view."""
+        self._log_lines.append((msg, tag))
+        if self._log_text is not None:
+            self._log_text.configure(state="normal")
+            self._log_text.insert("end", msg + "\n", tag)
+            self._log_text.see("end")
+            self._log_text.configure(state="disabled")
 
     def _drain_log(self) -> None:
+        if not self.root.winfo_exists():  # window closed; stop the after-loop
+            return
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", msg + "\n", self._tag_for(msg))
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
+                self._append_log(msg, self._tag_for(msg))
         except queue.Empty:
             pass
         # Re-enable Start when the worker finishes.
@@ -653,6 +834,75 @@ class App:
             self._set_status("idle")
         self.root.after(100, self._drain_log)
 
+    def _open_log_modal(self) -> None:
+        # Bring an already-open log window to the front instead of duplicating.
+        if self._log_win is not None and self._log_win.winfo_exists():
+            self._log_win.lift()
+            self._log_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Activity log")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.geometry("560x420")
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=PAD, pady=(PAD, GAP))
+        ttk.Label(head, text="Activity log", style="Title.TLabel").pack(side="left")
+        ttk.Button(head, text="Clear", command=self._clear_log).pack(side="right")
+
+        body = tk.Frame(win, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
+        text = tk.Text(
+            body,
+            state="disabled",
+            wrap="word",
+            bg=SURFACE,
+            fg=TEXT,
+            insertbackground=TEXT,
+            selectbackground=SURFACE2,
+            relief="flat",
+            font=FONT_MONO,
+            padx=8,
+            pady=6,
+            highlightthickness=0,
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(
+            body, style="Vertical.TScrollbar", command=text.yview
+        )
+        scroll.pack(side="right", fill="y")
+        text.configure(yscrollcommand=scroll.set)
+        text.tag_configure("ok", foreground=TEXT)
+        text.tag_configure("err", foreground=RED)
+        text.tag_configure("info", foreground=LOG_INFO)
+
+        # Load the buffered history.
+        text.configure(state="normal")
+        for msg, tag in self._log_lines:
+            text.insert("end", msg + "\n", tag)
+        text.see("end")
+        text.configure(state="disabled")
+
+        self._log_win = win
+        self._log_text = text  # live-append target while open
+
+        def on_close() -> None:
+            self._log_text = None
+            self._log_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.bind("<Escape>", lambda _e: on_close())
+
+        # Centre over the main window.
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        win.geometry(f"+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
+
     def refresh_windows(self) -> None:
         self.windows = capture.list_windows(skip_titles=(APP_TITLE,))
         labels = [f"{title}  [hwnd {hwnd}]" for hwnd, title in self.windows]
@@ -661,7 +911,7 @@ class App:
             if self.window_combo.current() < 0:  # nothing valid selected yet
                 self.window_combo.current(0)
         else:
-            self.window_var.set("— no windows found — click ⟳ Refresh")
+            self.window_var.set("No windows found — click Refresh")
 
     def _selected_hwnd(self) -> int | None:
         idx = self.window_combo.current()
@@ -670,16 +920,18 @@ class App:
             return None
         return self.windows[idx][0]
 
-    def _read_params(self) -> tuple[int, float, int, float] | None:
+    def _read_params(self) -> tuple[int | None, float, int, float] | None:
+        unlimited = self.unlimited_var.get()
         try:
-            count = int(self.count_var.get())
+            count = None if unlimited else int(self.count_var.get())
             interval = float(self.interval_var.get())
             retries = int(self.retries_var.get())
             threshold = float(self.threshold_var.get())
         except ValueError:
             messagebox.showerror(APP_TITLE, "Interval/Count/Retries/Threshold must be numbers.")
             return None
-        if count < 1 or interval < 0 or retries < 1 or not (0 < threshold <= 1):
+        bad_count = count is not None and count < 1
+        if bad_count or interval < 0 or retries < 1 or not (0 < threshold <= 1):
             messagebox.showerror(
                 APP_TITLE,
                 "Count>=1, Interval>=0, Retries>=1, 0<Threshold<=1.",
@@ -695,8 +947,11 @@ class App:
         self.window_combo.configure(state="disabled" if running else "readonly")
         self.refresh_btn.configure(state=state)
         self.dry_btn.configure(state=state)
+        self.unlimited_chk.configure(state=state)
         for entry in self._param_entries:
             entry.configure(state=state)
+        if not running:
+            self._apply_unlimited()  # keep Count greyed if Unlimited is still on
 
     def start(self) -> None:
         if self.worker is not None:
@@ -711,14 +966,16 @@ class App:
         if params is None:
             return
         count, interval, retries, threshold = params
+        self._save_settings()  # remember these values for next launch
 
         self.stop_event.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._set_running(True)
         self._set_status("running")
+        count_str = "unlimited" if count is None else count
         self.log(
-            f"Starting: gift={self.current_gift.name} count={count} "
+            f"Starting: gift={self.current_gift.name} count={count_str} "
             f"interval={interval}s retries={retries} threshold={threshold}"
         )
 
@@ -737,6 +994,22 @@ class App:
             daemon=True,
         )
         self.worker.start()
+        threading.Thread(target=self._watch_escape, daemon=True).start()
+
+    def _watch_escape(self) -> None:
+        """Poll the Esc key globally so a run can be aborted even while the
+        target window (not GiftDrop) holds the foreground."""
+        VK_ESCAPE = 0x1B
+        while self._running and not self.stop_event.is_set():
+            if win32api.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
+                self.root.after(0, self._esc_stop)
+                return
+            time.sleep(0.05)
+
+    def _esc_stop(self) -> None:
+        if self._running:
+            self.log("Esc pressed — cancelling.")
+            self.stop()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -814,9 +1087,10 @@ class App:
         photo = ImageTk.PhotoImage(preview)
         label = tk.Label(win, image=photo, bg=BG, bd=0)
         label.image = photo  # keep a reference
-        label.pack(padx=10, pady=10)
+        label.pack(padx=PAD, pady=PAD)
 
     def _on_close(self) -> None:
+        self._save_settings()
         self.stop_event.set()
         self.root.destroy()
 

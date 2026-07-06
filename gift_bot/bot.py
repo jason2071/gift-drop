@@ -128,7 +128,7 @@ def _send_point_from_popup(left: int, top: int, popup: "matcher.Match") -> tuple
 
 def run(
     hwnd: int,
-    count: int,
+    count: int | None,
     interval: float,
     retries: int,
     threshold: float,
@@ -137,6 +137,9 @@ def run(
     gift: "gifts.Gift | None" = None,
 ) -> None:
     """Send the gift ``count`` times, ``interval`` seconds apart.
+
+    ``count`` of ``None`` means unlimited -- send until a detection fails or
+    ``stop_event`` is set.
 
     ``gift`` selects which icon/popup templates to use; when ``None`` the bundled
     love-you templates are used.
@@ -158,12 +161,15 @@ def run(
     if templates.send_button is not None:
         log("Using send-button.png for precise Send clicks.")
 
+    total = "∞" if count is None else count  # ∞ for unlimited
     sent = 0
-    for i in range(1, count + 1):
+    i = 0
+    while count is None or i < count:
         if stop_event.is_set():
             log("Stopped by user.")
             break
-        log(f"[{i}/{count}] sending...")
+        i += 1
+        log(f"[{i}/{total}] sending...")
         result = send_once(hwnd, templates, threshold, retries, log)
 
         if result is Result.SENT:
@@ -172,11 +178,12 @@ def run(
             log(f"Stopping: {result.value} after {retries} retries.")
             break
 
-        if i < count and not stop_event.is_set():
+        more = count is None or i < count
+        if more and not stop_event.is_set():
             # Interruptible sleep so Stop is responsive during the interval.
             slept = 0.0
             while slept < interval and not stop_event.is_set():
                 time.sleep(min(0.1, interval - slept))
                 slept += 0.1
 
-    log(f"Done. Gifts sent: {sent}/{count}.")
+    log(f"Done. Gifts sent: {sent}.")

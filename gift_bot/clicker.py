@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 
 import pyautogui
+import win32api
 import win32con
 import win32gui
 import win32process
@@ -33,7 +34,7 @@ def to_front(hwnd: int, settle: float = 0.25) -> bool:
     if fg == hwnd:
         return True
 
-    our_tid = win32process.GetCurrentThreadId()
+    our_tid = win32api.GetCurrentThreadId()
     fg_tid, _ = win32process.GetWindowThreadProcessId(fg) if fg else (0, 0)
     target_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
 

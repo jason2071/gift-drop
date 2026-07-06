@@ -16,6 +16,7 @@ from typing import Callable
 
 from . import capture
 from . import clicker
+from . import gifts
 from . import matcher
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,9 +47,13 @@ class Templates:
     send_button: "matcher.np.ndarray | None"
 
     @classmethod
-    def load(cls) -> "Templates":
-        icon = matcher.load_template(ICON_TEMPLATE_PATH)
-        popup = matcher.load_template(POPUP_TEMPLATE_PATH)
+    def load(
+        cls,
+        icon_path: "str | Path" = ICON_TEMPLATE_PATH,
+        popup_path: "str | Path" = POPUP_TEMPLATE_PATH,
+    ) -> "Templates":
+        icon = matcher.load_template(icon_path)
+        popup = matcher.load_template(popup_path)
         send_button = (
             matcher.load_template(SEND_BUTTON_TEMPLATE_PATH)
             if SEND_BUTTON_TEMPLATE_PATH.exists()
@@ -129,17 +134,26 @@ def run(
     threshold: float,
     stop_event: threading.Event,
     log: Logger,
+    gift: "gifts.Gift | None" = None,
 ) -> None:
     """Send the gift ``count`` times, ``interval`` seconds apart.
+
+    ``gift`` selects which icon/popup templates to use; when ``None`` the bundled
+    love-you templates are used.
 
     Stops early if a detection fails (satisfies "retry N, else stop") or if
     ``stop_event`` is set.
     """
+    icon_path = gift.icon_path if gift is not None else ICON_TEMPLATE_PATH
+    popup_path = gift.popup_path if gift is not None else POPUP_TEMPLATE_PATH
     try:
-        templates = Templates.load()
+        templates = Templates.load(icon_path, popup_path)
     except FileNotFoundError as exc:
         log(f"ERROR: {exc}")
         return
+
+    if gift is not None:
+        log(f"Gift: {gift.name}")
 
     if templates.send_button is not None:
         log("Using send-button.png for precise Send clicks.")

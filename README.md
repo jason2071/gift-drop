@@ -1,20 +1,23 @@
 # GiftDrop
 
-A Windows desktop bot that auto-sends the **love-you** gift on a TikTok Live gift
-page. It detects the gift icon on any open window (even when the window is
-covered by others), hovers it to reveal the popup, and clicks **Send** — repeated
-a configurable number of times at a configurable interval.
+A Windows desktop bot that auto-sends a chosen gift on a TikTok Live gift page.
+It detects the gift icon on any open window (even when the window is covered by
+others), hovers it to reveal the popup, and clicks **Send** — repeated a
+configurable number of times at a configurable interval.
+
+Ships with the **Love You** gift, and you can **add your own gifts** from the UI
+(no code change) — see [Gifts](#gifts).
 
 ## How it works
 
 1. **Detect (occlusion-proof):** captures the chosen window with the Win32
    `PrintWindow` + `PW_RENDERFULLCONTENT` API, which grabs the content even when
-   the window is behind others, then finds `love-you.png` with multi-scale
-   OpenCV template matching.
+   the window is behind others, then finds the selected gift's icon with
+   multi-scale OpenCV template matching.
 2. **Hover:** brings the window to the foreground and moves the real cursor onto
    the icon so the Send popup appears (a genuine hover is required for TikTok's
    web UI).
-3. **Confirm + click:** re-detects `love-you-send.png` to confirm the popup, then
+3. **Confirm + click:** re-detects the gift's popup template to confirm it, then
    clicks the **Send** button inside it.
 4. Repeats `Count` times, `Interval` seconds apart. If the icon is not found
    after `Retries` (default 3) attempts, it **stops**.
@@ -37,16 +40,38 @@ python main.py
    visible. It may be partially behind another window.
 2. Pick the window in the **Target window** dropdown (click **Refresh** if it is
    not listed).
-3. Click **Dry-run** first: it captures and detects the icon **without clicking**
+3. In the **Gift to send** card, confirm the gift — click the thumbnail to pick a
+   different one or add a new gift.
+4. Click **Dry-run** first: it captures and detects the icon **without clicking**
    and shows a preview with a red box on the match. Lower **Threshold** if it
    reports "not found".
-4. Set **Interval** and **Count**, then click **Start**. Use **Stop** to abort.
+5. Set **Interval** and **Count**, then click **Start**. Use **Stop** to abort.
+
+## Gifts
+
+A *gift* is a pair of PNG templates in `assets/`:
+
+| File | What it is |
+|------|------------|
+| `<name>.png` | The gift **icon** as it appears in the gift tray. |
+| `<name>-send.png` | The hover **popup** that contains the Send button. |
+
+Any pair found in `assets/` shows up automatically in the picker.
+
+**Add a gift from the UI:** click the gift thumbnail → **＋ Add gift** → give it a
+name, browse the icon PNG and the send-popup PNG, then **Save**. The files are
+copied into `assets/` and the gift is selected immediately.
+
+**Capturing templates:** screenshot the gift page at the zoom you'll run at, crop
+the gift icon tightly for `<name>.png`, and crop the hover popup (icon + Send
+button) for `<name>-send.png`.
 
 ## Controls
 
 | Field | Meaning |
 |-------|---------|
 | Target window | Which window to search/click. |
+| Gift to send | The gift to detect and send; click to change or add. |
 | Interval (s) | Delay between each Send. |
 | Count | How many gifts to send. |
 | Threshold | Match confidence 0–1 (default 0.8). Lower = more lenient. |
@@ -68,16 +93,17 @@ python main.py
 ## Project layout
 
 ```
-macro-click/
+gift-drop/
 ├─ main.py                    # Entry point; sets DPI awareness, launches GUI.
 ├─ requirements.txt
 ├─ README.md
-├─ assets/
-│  ├─ love-you.png            # Gift icon template (38×38).
-│  └─ love-you-send.png       # Popup + Send template (106×112).
+├─ assets/                    # Gift templates: <name>.png + <name>-send.png pairs.
+│  ├─ love-you.png            # Gift icon template.
+│  └─ love-you-send.png       # Popup + Send template.
 └─ gift_bot/                  # Application package.
    ├─ __init__.py             # Exposes launch().
-   ├─ gui.py                  # tkinter UI (dropdown, fields, Start/Stop, Dry-run, log).
+   ├─ gui.py                  # tkinter UI (light theme, gift picker, Start/Stop, Dry-run, log).
+   ├─ gifts.py                # Gift catalogue: discovers icon/popup pairs in assets/.
    ├─ bot.py                  # Orchestration: detect → hover → confirm → click Send.
    ├─ capture.py              # Window enumeration + occlusion-proof PrintWindow capture.
    ├─ matcher.py              # Multi-scale OpenCV template matching.

@@ -12,7 +12,7 @@ import sys
 
 from cx_Freeze import Executable, setup
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 build_exe_options = {
     "packages": [

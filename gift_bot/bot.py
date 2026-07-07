@@ -29,6 +29,11 @@ SEND_BUTTON_TEMPLATE_PATH = ASSETS_DIR / "send-button.png"
 SEND_OFFSET_X_RATIO = 0.5
 SEND_OFFSET_Y_RATIO = 0.86
 
+# The interactive gift tray is docked at the bottom of the TikTok window, but the
+# same gift also animates in the live-stream overlay near the top. Restrict
+# detection to the bottom band so we only ever hover/click the real tray icon.
+SEARCH_ROI_TOP = 0.5
+
 Logger = Callable[[str], None]
 
 
@@ -61,11 +66,20 @@ class Templates:
         return cls(icon=icon, popup=popup, send_button=send_button)
 
 
-def _detect(hwnd: int, template, threshold: float, retries: int, log: Logger):
+def _detect(
+    hwnd: int,
+    template,
+    threshold: float,
+    retries: int,
+    log: Logger,
+    roi_top: float = SEARCH_ROI_TOP,
+):
     """Capture and match up to ``retries`` times; return (Match, origin) or (None, None)."""
     for attempt in range(1, retries + 1):
         image, origin = capture.capture_window(hwnd)
-        match = matcher.find(image, template, threshold=threshold)
+        match = matcher.find(
+            image, template, threshold=threshold, roi_top=roi_top, prefer="bottom"
+        )
         if match is not None:
             log(f"  found (attempt {attempt}/{retries}, score {match.score:.2f})")
             return match, origin
@@ -105,7 +119,13 @@ def send_once(
     # 4. Compute the Send click point and click it.
     if templates.send_button is not None:
         image, origin = capture.capture_window(hwnd)
-        btn = matcher.find(image, templates.send_button, threshold=threshold)
+        btn = matcher.find(
+            image,
+            templates.send_button,
+            threshold=threshold,
+            roi_top=SEARCH_ROI_TOP,
+            prefer="bottom",
+        )
         if btn is not None:
             left, top = origin
             send_screen = (left + btn.cx, top + btn.cy)
@@ -134,6 +154,7 @@ def run(
     stop_event: threading.Event,
     log: Logger,
     gift: "gifts.Gift | None" = None,
+    on_sent: "Callable[[int], None] | None" = None,
 ) -> None:
     """Send the gift ``count`` times, ``interval`` seconds apart.
 
@@ -142,6 +163,9 @@ def run(
 
     ``gift`` selects which icon/popup templates to use; when ``None`` the bundled
     love-you templates are used.
+
+    ``on_sent``, if given, is called with the running number of gifts sent after
+    each successful send, so a UI can show a live counter.
 
     Stops early if a detection fails (satisfies "retry N, else stop") or if
     ``stop_event`` is set.
@@ -173,6 +197,8 @@ def run(
 
         if result is Result.SENT:
             sent += 1
+            if on_sent is not None:
+                on_sent(sent)
         else:
             log(f"Stopping: {result.value} after {retries} retries.")
             break

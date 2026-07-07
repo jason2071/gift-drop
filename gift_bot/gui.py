@@ -85,6 +85,12 @@ class App:
         self._run_gen = 0        # per-run token so a stale Esc watcher exits
         self._preview_win: tk.Toplevel | None = None
 
+        # Live "sent" counter shown in the status label during/after a run.
+        self._status_state = "idle"
+        self._sent = 0
+        self._sent_total: int | None = None  # None == unlimited
+        self._show_count = False             # reveal the counter once a run starts
+
         self._saved = config.load()
         gifts.seed()  # packaged build: populate the writable assets dir on first run
         # store  = every gift found in assets/ (the full library)
@@ -382,7 +388,17 @@ class App:
             "stopped": (RED, "Stopped"),
         }
         color, text = colors.get(state, (MUTED, "Idle"))
+        self._status_state = state
+        if self._show_count:
+            total = "∞" if self._sent_total is None else self._sent_total
+            text = f"{text}  ·  {self._sent}/{total} sent"
         self.status_label.configure(text=f"● {text}", fg=color)
+
+    def _report_sent(self, sent: int) -> None:
+        """Update the live sent counter. Runs on the Tk thread (queued by the
+        worker via ``_ui_queue``), so it is safe to touch widgets here."""
+        self._sent = sent
+        self._set_status(self._status_state)
 
     # ---- gift selection --------------------------------------------------
     def _load_thumb(self, path, size: int = 56):
@@ -769,11 +785,21 @@ class App:
 
     def _auto_slug(self, icon_path: str) -> str:
         """Derive a unique, filesystem-safe slug for a new gift. Uses the icon's
-        filename, falling back to gift-N, and appends -N to avoid collisions."""
+        filename, kept short (first 2 words, <=16 chars) so the display name is
+        tidy, falls back to gift-N, and appends -N to avoid collisions."""
         stem = Path(icon_path).stem
         if stem.endswith("-send"):
             stem = stem[: -len("-send")]
-        base = self._slug(stem) or "gift"
+        # Keep the auto name short: up to the first two words, <=16 chars, and
+        # never cut mid-word so the display label stays readable.
+        words = [w for w in self._slug(stem).split("-") if w][:2]
+        base = ""
+        for w in words:
+            candidate = w if not base else f"{base}-{w}"
+            if len(candidate) > 16:
+                break
+            base = candidate
+        base = base or (words[0][:16] if words else "") or "gift"
         slug, n = base, 2
         while (
             (gifts.ASSETS_DIR / f"{slug}.png").exists()
@@ -861,11 +887,15 @@ class App:
         except queue.Empty:
             pass
         # Run any UI work queued by worker threads (Tk touched only here).
-        try:
-            while True:
-                self._ui_queue.get_nowait()()
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as exc:  # noqa: BLE001 - one bad callback must not kill the drain loop
+                self._append_log(f"UI error: {exc}", "err")
         # Re-enable Start when the worker finishes.
         if self.worker is not None and not self.worker.is_alive():
             self.worker = None
@@ -1031,12 +1061,20 @@ class App:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._set_running(True)
+        # Reset + reveal the live sent counter (0/total) for this run.
+        self._sent = 0
+        self._sent_total = count
+        self._show_count = True
         self._set_status("running")
         count_str = "unlimited" if count is None else count
         self.log(
             f"Starting: gift={self.current_gift.name} count={count_str} "
             f"interval={interval}s retries={retries} threshold={threshold}"
         )
+
+        # Worker thread must not touch Tk: queue the counter update for _drain_log.
+        def on_sent(sent: int) -> None:
+            self._ui_queue.put(lambda: self._report_sent(sent))
 
         self.worker = threading.Thread(
             target=bot.run,
@@ -1050,6 +1088,7 @@ class App:
                 self.log,
                 self.current_gift,
             ),
+            kwargs={"on_sent": on_sent},
             daemon=True,
         )
         self.worker.start()
@@ -1118,7 +1157,13 @@ class App:
             try:
                 image, _ = capture.capture_window(hwnd)
                 icon_tpl = matcher.load_template(gift.icon_path)
-                match = matcher.find(image, icon_tpl, threshold=threshold)
+                match = matcher.find(
+                    image,
+                    icon_tpl,
+                    threshold=threshold,
+                    roi_top=bot.SEARCH_ROI_TOP,
+                    prefer="bottom",
+                )
             except Exception as exc:  # noqa: BLE001 - surface any capture/match error
                 self.log(f"Dry-run error: {exc}")
                 self._ui_queue.put(self._end_dry_run)
@@ -1145,10 +1190,17 @@ class App:
             self._show_preview(image, match)
 
     def _show_preview(self, image, match) -> None:
-        from PIL import ImageDraw, ImageTk
+        from PIL import Image, ImageDraw, ImageTk
 
         preview = image.convert("RGB").copy()
         draw = ImageDraw.Draw(preview)
+        # Dim the ignored top band and mark where the search area begins, so it is
+        # obvious the bot only looks at the bottom gift tray.
+        roi_y = int(preview.height * bot.SEARCH_ROI_TOP)
+        if roi_y > 0:
+            shade = Image.new("RGBA", (preview.width, roi_y), (0, 0, 0, 90))
+            preview.paste(Image.new("RGB", (preview.width, roi_y)), (0, 0), shade)
+            draw.line([(0, roi_y), (preview.width, roi_y)], fill=(30, 102, 245), width=2)
         draw.rectangle(
             [match.left, match.top, match.left + match.w, match.top + match.h],
             outline=(210, 15, 57),

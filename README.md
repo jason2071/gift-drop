@@ -40,8 +40,8 @@ python main.py
    visible. It may be partially behind another window.
 2. Pick the window in the **Target window** dropdown (click **Refresh** if it is
    not listed).
-3. In the **Gift to send** card, confirm the gift — click the thumbnail to pick a
-   different one or add a new gift.
+3. In the **Gift to send** card, confirm the gift — click a pinned thumbnail to
+   select it, or click **Store gift** to pick from your library or add a new gift.
 4. Click **Dry-run** first: it captures and detects the icon **without clicking**
    and shows a preview with a red box on the match. Lower **Threshold** if it
    reports "not found".
@@ -58,9 +58,11 @@ A *gift* is a pair of PNG templates in `assets/`:
 
 Any pair found in `assets/` shows up automatically in the picker.
 
-**Add a gift from the UI:** click the gift thumbnail → **＋ Add gift** → give it a
-name, browse the icon PNG and the send-popup PNG, then **Save**. The files are
-copied into `assets/` and the gift is selected immediately.
+**Add a gift from the UI:** click **Store gift** → **Add gift** → **Browse** the
+icon PNG and the send-popup PNG → **Save gift**. The files are copied into the
+assets dir and the gift is pinned and ready. There's no name field — the gift's
+label comes from the **icon file's name** (`rose.png` → **Rose**), so name that
+file before uploading. Step-by-step walkthrough: [docs/add-a-gift.md](docs/add-a-gift.md).
 
 **Capturing templates:** screenshot the gift page at the zoom you'll run at, crop
 the gift icon tightly for `<name>.png`, and crop the hover popup (icon + Send

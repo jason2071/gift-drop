@@ -27,6 +27,7 @@ import win32gui
 
 from . import bot
 from . import capture
+from . import clicker
 from . import config
 from . import gifts
 from . import matcher
@@ -85,6 +86,16 @@ class App:
         self._run_gen = 0        # per-run token so a stale Esc watcher exits
         self._preview_win: tk.Toplevel | None = None
 
+        # Auto-press L: a standalone feature, unrelated to the gift bot. A Start/
+        # Stop toggle sets _spam_active; a lifetime worker thread then repeatedly
+        # sends an L keypress to the target window until it's cleared. _closing
+        # retires the thread on exit. Mirrors read off the Tk thread are plain
+        # values (Tk vars/widgets must only be touched on the main thread).
+        self._closing = False
+        self._spam_active = False
+        self._spam_interval = 0.1
+        self._target_hwnd: int | None = None  # Tk-synced mirror the worker reads
+
         # Live "sent" counter shown in the status label during/after a run.
         self._status_state = "idle"
         self._sent = 0
@@ -113,6 +124,8 @@ class App:
         self.refresh_windows()
         self._fit_window()
         self._update_busy = False
+        # Lifetime worker: sends L to the target while Auto-press L is active.
+        threading.Thread(target=self._watch_spam, daemon=True).start()
         self.root.after(100, self._drain_log)
         # Auto-check for a newer release shortly after launch (silent if none).
         self.root.after(2500, lambda: self._check_updates(manual=False))
@@ -316,6 +329,10 @@ class App:
             target, textvariable=self.window_var, state="readonly"
         )
         self.window_combo.grid(row=1, column=0, columnspan=3, sticky="we")
+        # Mirror the picked hwnd for the hold-L poll thread (Tk vars are on-thread).
+        self.window_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._update_target_mirror()
+        )
         self.refresh_btn = ttk.Button(
             target, text="Refresh", command=self.refresh_windows
         )
@@ -368,6 +385,37 @@ class App:
         self.dry_btn.pack(side="left")
         ttk.Button(buttons, text="Log", command=self._open_log_modal).pack(
             side="left", padx=GAP
+        )
+
+        # ---- Auto-press L: a standalone feature, no relation to the gift bot
+        # above. A Start/Stop toggle makes the app repeatedly send an L keypress
+        # to the selected target window — so you don't have to hold the key.
+        spam = self._card()
+        ttk.Label(spam, text="Auto-press L", style="Heading.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 6)
+        )
+        self.spam_interval_var = tk.StringVar(
+            value=str(self._saved.get("spam_interval", "0.1"))
+        )
+        self._sync_spam_interval()  # seed the plain-float mirror the worker reads
+        ttk.Label(spam, text="Interval (s)", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, GAP), pady=4
+        )
+        ttk.Entry(spam, textvariable=self.spam_interval_var, width=8).grid(
+            row=1, column=1, sticky="w", pady=4
+        )
+        self.spam_btn = ttk.Button(
+            spam, text="Start", command=self._toggle_spam_run
+        )
+        self.spam_btn.grid(row=1, column=3, sticky="e", padx=(GAP, 0))
+        ttk.Label(
+            spam,
+            text="Sends L to the target every interval until you click Stop (or press Esc).",
+            style="Field.TLabel",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        spam.columnconfigure(2, weight=1)
+        self.spam_interval_var.trace_add(
+            "write", lambda *_: self._sync_spam_interval()
         )
 
     def _field(
@@ -558,6 +606,7 @@ class App:
                 "threshold": self.threshold_var.get(),
                 "retries": self.retries_var.get(),
                 "unlimited": self.unlimited_var.get(),
+                "spam_interval": self.spam_interval_var.get(),
                 "gift": self.current_gift.icon_path.stem if self.current_gift else None,
                 "shortcuts": [g.icon_path.stem for g in self.shortcuts],
             }
@@ -983,6 +1032,7 @@ class App:
         self.window_combo["values"] = labels
         if not labels:
             self.window_var.set("No windows found — click Refresh")
+            self._update_target_mirror()
             return
         # Keep the same target across refreshes; only default to 0 on first load.
         hwnds = [hwnd for hwnd, _ in self.windows]
@@ -993,6 +1043,7 @@ class App:
         else:
             # Previous target vanished; clear rather than silently retarget.
             self.window_combo.set("")
+        self._update_target_mirror()
 
     def _selected_hwnd_quiet(self) -> int | None:
         """Currently selected hwnd, or None — without warning popups."""
@@ -1000,6 +1051,10 @@ class App:
         if 0 <= idx < len(self.windows):
             return self.windows[idx][0]
         return None
+
+    def _update_target_mirror(self) -> None:
+        """Tk-thread: refresh the plain-int hwnd mirror the hold-L thread reads."""
+        self._target_hwnd = self._selected_hwnd_quiet()
 
     def _selected_hwnd(self) -> int | None:
         idx = self.window_combo.current()
@@ -1119,15 +1174,95 @@ class App:
             time.sleep(0.05)
 
     def _esc_stop(self) -> None:
-        """Esc handler on the Tk thread (root binding), for when GiftDrop has focus."""
+        """Esc handler on the Tk thread (root binding), for when GiftDrop has focus.
+        Cancels a gift run and/or Auto-press L, whichever is active."""
         if self._running:
             self.log("Esc pressed — cancelling.")
             self.stop()
+        if self._spam_active:
+            self.log("Esc pressed — stopping Auto-press L.")
+            self._spam_active = False
+            self.spam_btn.configure(text="Start")
 
     def stop(self) -> None:
         self.stop_event.set()
         self._set_status("stopped")
         self.log("Stop requested...")
+
+    # ---- Auto-press L (standalone; unrelated to the gift bot) -----------
+    def _toggle_spam_run(self) -> None:
+        """Tk-thread: Start/Stop toggle for the auto-press-L worker."""
+        if self._spam_active:
+            self._spam_active = False
+            self.spam_btn.configure(text="Start")
+            self.log("Auto-press L stopped.")
+            return
+        if self._target_hwnd is None:
+            messagebox.showwarning(APP_TITLE, "Select a target window first.")
+            return
+        self._sync_spam_interval()
+        self._spam_active = True
+        self.spam_btn.configure(text="Stop")
+        self.log("Auto-press L started.")
+
+    def _sync_spam_interval(self) -> None:
+        """Tk-thread: parse the interval field into the plain-float mirror the
+        worker reads. Ignore blank/invalid input (keep the last good value); floor
+        at 0.01s so an empty/zero value can't spin the worker into a busy loop."""
+        try:
+            self._spam_interval = max(0.01, float(self.spam_interval_var.get()))
+        except ValueError:
+            pass
+
+    def _watch_spam(self) -> None:
+        """Lifetime worker for Auto-press L. While _spam_active, foreground the
+        target window (once) and send a real L keypress every interval. Runs off
+        the Tk thread, so it only reads the plain-value mirrors
+        (_spam_active/_spam_interval/_target_hwnd) and logs via the queue-backed
+        log — it never touches Tk widgets. Esc cancels it while the target is on
+        top (mirrors the gift bot's _watch_escape). To reset the Start/Stop button
+        after stopping itself it queues _spam_reset_button on _ui_queue."""
+        VK_L = 0x4C
+        VK_ESCAPE = 0x1B
+        KEYEVENTF_KEYUP = 0x0002
+        started = False
+        while not self._closing:
+            if not self._spam_active:
+                started = False
+                time.sleep(0.05)
+                continue
+            hwnd = self._target_hwnd  # plain mirror; safe off the Tk thread
+            if hwnd is None:
+                self.log("Auto-press L: no target window — stopping.")
+                self._spam_active = False
+                self._ui_queue.put(self._spam_reset_button)
+                started = False
+                continue
+            # Esc cancels, but only while the target is on top so an unrelated Esc
+            # elsewhere doesn't stop it (same rule as the gift bot's Esc watcher).
+            if (
+                win32gui.GetForegroundWindow() == hwnd
+                and win32api.GetAsyncKeyState(VK_ESCAPE) & 0x8000
+            ):
+                self.log("Esc pressed — stopping Auto-press L.")
+                self._spam_active = False
+                self._ui_queue.put(self._spam_reset_button)
+                started = False
+                continue
+            if not started:
+                try:
+                    clicker.to_front(hwnd)
+                except Exception as exc:  # noqa: BLE001 - surface, keep going
+                    self.log(f"Auto-press L focus error: {exc}")
+                started = True
+            win32api.keybd_event(VK_L, 0, 0, 0)
+            win32api.keybd_event(VK_L, 0, KEYEVENTF_KEYUP, 0)
+            time.sleep(self._spam_interval)
+
+    def _spam_reset_button(self) -> None:
+        """Tk-thread: restore the Start label after the worker stopped itself."""
+        if not self._spam_active:
+            self.spam_btn.configure(text="Start")
 
     def dry_run(self) -> None:
         """Capture the selected window, detect without clicking, show an overlay.
@@ -1301,11 +1436,13 @@ class App:
             webbrowser.open(updater.RELEASES_PAGE)
             return
         self._save_settings()
+        self._closing = True  # retire the hold-L poll thread
         self.stop_event.set()
         self.root.after(150, self.root.destroy)  # exit so the swap can proceed
 
     def _on_close(self) -> None:
         self._save_settings()
+        self._closing = True  # retire the hold-L poll thread
         self.stop_event.set()
         self.root.destroy()
 

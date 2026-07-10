@@ -47,6 +47,24 @@ python main.py
    reports "not found".
 5. Set **Interval** and **Count**, then click **Start**. Use **Stop** to abort.
 
+## Auto-press L
+
+A separate feature, unrelated to the gift bot above: GiftDrop presses the `L` key
+for you, repeatedly, so you don't have to hold it down yourself. Use it for a
+keyboard-driven action on the page (e.g. a "like" bound to `L` that you'd normally
+hold).
+
+1. Pick the page in the **Target window** dropdown (same one the gift bot uses).
+2. In the **Auto-press L** card, set the **Interval (s)** between presses
+   (default `0.1`).
+3. Click **Start** → GiftDrop brings the target to the front and taps `L` every
+   interval. Click **Stop** — or press **Esc** — to end. If the target window
+   disappears it stops on its own.
+
+> It sends a **real** keypress, so it brings the target window to the foreground
+> while running (same trade-off as the gift bot's clicking) — don't type elsewhere
+> while it's active.
+
 ## Gifts
 
 A *gift* is a pair of PNG templates in `assets/`:
@@ -79,6 +97,7 @@ button) for `<name>-send.png`.
 | Threshold | Match confidence 0–1 (default 0.8). Lower = more lenient. |
 | Retries | Detection attempts before stopping (default 3). |
 | Dry-run | Detect + preview only, no clicking. |
+| Auto-press L (Start/Stop) | Repeatedly presses `L` on the target window; see [Auto-press L](#auto-press-l) (separate from the gift bot). |
 
 ## Updating
 
@@ -92,6 +111,10 @@ settings live under `%APPDATA%/GiftDrop/` and are kept across updates.
 - **Foreground clicking takes over the mouse** while running. Do not use the PC
   during a run. **Failsafe:** slam the cursor into any screen corner to abort
   instantly; or click **Stop**.
+- **Auto-press L takes over the foreground** while running: it pulls the target
+  window to the front so the real `L` key presses land there. It is not a silent
+  background injection — don't type elsewhere while it's active; click **Stop** to
+  end it.
 - **If detection misses**, it is almost always display scaling. The bot already
   tries several scales; use **Dry-run** to tune **Threshold**, or make sure the
   gift icon is fully visible at the same zoom as when the templates were captured.
